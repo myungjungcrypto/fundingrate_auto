@@ -1,0 +1,9 @@
+{
+    "name": "fundingrate_auto",
+    "private": true,
+    "type": "module",
+    "engines": {
+      "node": "22.x"
+    }
+  }
+  
