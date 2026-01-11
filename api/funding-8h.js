@@ -1,6 +1,6 @@
 // api/funding-8h.js
 // Aggregates funding/mark from Variational, Binance, Lighter and normalizes to 8h.
-// Lighter: market_id mapping + fundings?market_id=...&count_back=8 => sum hourly to 8h (fallback to funding-rates last-candidate)
+// Lighter: auto-probe fundings endpoint (multiple param variants) -> sum hourly (count_back=8) if possible, fallback to funding-rates last-candidate.
 
 const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
 
@@ -44,7 +44,7 @@ function pickField(obj, keys) {
 }
 
 /**
- * Variational funding_rate is ANNUAL (e.g. 0.1095 = 10.95% APR-like)
+ * Variational funding_rate is ANNUAL (e.g. 0.1095 = 10.95% annual)
  * Convert to 8h window: 365 days * 3 windows/day = 1095 windows/year
  */
 function annualTo8h(annualRate) {
@@ -66,18 +66,38 @@ async function fetchJson(url, timeoutMs = 8000) {
 }
 
 /**
- * Helper: try multiple URLs (for param name differences)
+ * Try many URLs safely, keep report for debugging.
+ * Returns { data, usedUrl, triedCount, errorSummary }
  */
-async function fetchJsonTry_(urls, timeoutMs = 8000) {
-  let lastErr = null;
+async function fetchJsonProbe_(urls, timeoutMs = 8000, maxTries = 14) {
+  const errs = [];
+  let tried = 0;
+
   for (const url of urls) {
+    tried++;
+    if (tried > maxTries) break;
+
     try {
-      return await fetchJson(url, timeoutMs);
+      const data = await fetchJson(url, timeoutMs);
+      return {
+        data,
+        usedUrl: url,
+        triedCount: tried,
+        errorSummary: errs.length ? errs.slice(0, 4).join(" | ") : null,
+      };
     } catch (e) {
-      lastErr = e;
+      const msg = String(e?.message ?? e);
+      // keep compact
+      errs.push(msg.replace(/\s+/g, " ").slice(0, 180));
     }
   }
-  throw lastErr || new Error("fetchJsonTry_ failed");
+
+  return {
+    data: null,
+    usedUrl: null,
+    triedCount: tried,
+    errorSummary: errs.length ? errs.slice(0, 6).join(" | ") : "unknown error",
+  };
 }
 
 /** ---------------- Variational ---------------- */
@@ -103,7 +123,7 @@ async function getVariational() {
       exchange: "variational",
       symbol: sym,
       funding_rate_raw: rateAnnual,       // annual
-      funding_interval_s: 28800,          // output normalized to 8h
+      funding_interval_s: 28800,          // normalized output to 8h
       funding_rate_next_interval: rate8h, // next 8h equivalent
       funding_rate_8h: rate8h,
       mark_price: toNum(it.mark_price),
@@ -154,13 +174,8 @@ async function getBinance() {
   return rows;
 }
 
-/** ---------------- Lighter ----------------
- * Strategy:
- * 1) Try /api/v1/fundings?market_id=...&count_back=8 (snake_case)
- *    - If it returns hourly slices: sum last 8 rates => 8h funding
- *    - If it returns 8h slices: take last one
- * 2) Fallback: /api/v1/funding-rates and pick LAST candidate for exact symbol match
- */
+/** ---------------- Lighter ---------------- */
+
 function lighterGetRateRaw_(item) {
   return toNum(
     pickField(item, [
@@ -176,11 +191,21 @@ function lighterGetRateRaw_(item) {
 }
 
 function lighterGetTimestampMs_(item) {
-  const v = pickField(item, ["timestamp", "ts", "time", "created_at", "createdAt", "updated_at", "updatedAt"]);
+  const v = pickField(item, [
+    "timestamp",
+    "ts",
+    "time",
+    "created_at",
+    "createdAt",
+    "updated_at",
+    "updatedAt",
+    "block_time",
+    "blockTime",
+  ]);
   const n = toNum(v);
   if (n === null) return null;
 
-  // Heuristic: if it's in seconds, convert to ms
+  // Heuristic: if seconds-like, convert to ms
   if (n < 10_000_000_000) return n * 1000;
   return n;
 }
@@ -188,32 +213,27 @@ function lighterGetTimestampMs_(item) {
 function lighterStrictSymbol_(item) {
   const raw = String(
     pickField(item, ["symbol", "ticker", "market", "marketSymbol", "name", "base_asset", "baseAsset", "underlying"]) || ""
-  ).toUpperCase().trim();
+  )
+    .toUpperCase()
+    .trim();
 
-  // ✅ strict match only
-  if (TARGETS.includes(raw)) return raw;
-  return null;
+  return TARGETS.includes(raw) ? raw : null;
 }
 
-function lighterGetMarketId_(item) {
-  const n = toNum(
-    pickField(item, [
-      "market_id",
-      "marketId",
-      "market_index",
-      "marketIndex",
-      "market",
-      "marketID",
-      "marketid",
-    ])
-  );
-  return n === null ? null : n;
+function inferIntervalSFromTimestamps_(tsListMs) {
+  const ts = tsListMs.filter((x) => x != null).slice().sort((a, b) => a - b);
+  if (ts.length < 2) return null;
+
+  const diffs = [];
+  for (let i = 1; i < ts.length; i++) diffs.push((ts[i] - ts[i - 1]) / 1000);
+  diffs.sort((a, b) => a - b);
+  const mid = diffs[Math.floor(diffs.length / 2)];
+  return Number.isFinite(mid) && mid > 0 ? mid : null;
 }
 
 function compute8hFromFundings_(fundings) {
   if (!Array.isArray(fundings) || !fundings.length) return null;
 
-  // Extract (ts, rate)
   const pts = fundings
     .map((x) => ({
       ts: lighterGetTimestampMs_(x),
@@ -223,61 +243,134 @@ function compute8hFromFundings_(fundings) {
 
   if (!pts.length) return null;
 
-  // If we have timestamps, estimate interval
-  let inferredIntervalS = null;
-  const tsList = pts.map((p) => p.ts).filter((t) => t !== null).sort((a, b) => a - b);
-  if (tsList.length >= 2) {
-    const diffs = [];
-    for (let i = 1; i < tsList.length; i++) diffs.push((tsList[i] - tsList[i - 1]) / 1000);
-    diffs.sort((a, b) => a - b);
-    const mid = diffs[Math.floor(diffs.length / 2)];
-    if (Number.isFinite(mid) && mid > 0) inferredIntervalS = mid;
-  }
+  const inferredIntervalS = inferIntervalSFromTimestamps_(pts.map((p) => p.ts));
 
-  // Heuristic: if ~1h slices => sum to 8h
+  // ✅ If looks like hourly (~1h), sum all returned (ideally 8)
   if (inferredIntervalS && inferredIntervalS > 2500 && inferredIntervalS < 5000) {
     const sum = pts.reduce((acc, p) => acc + p.r, 0);
     return { rate8h: sum, method: "sum_hourly", inferredIntervalS };
   }
 
-  // Else: assume each entry is already 8h (or not hourly) => take last
+  // If looks like 8h (~28800s), last value
+  if (inferredIntervalS && inferredIntervalS > 20000 && inferredIntervalS < 40000) {
+    return { rate8h: pts[pts.length - 1].r, method: "last_8h", inferredIntervalS };
+  }
+
+  // Unknown: prefer last (safer)
+  return { rate8h: pts[pts.length - 1].r, method: "last_value", inferredIntervalS };
+}
+
+/**
+ * Build many fundings URL variants to "auto-discover" correct params.
+ * We keep it bounded (maxTries in fetchJsonProbe_) to avoid timeouts.
+ */
+function buildLighterFundingsProbeUrls_(marketId) {
+  const base = `${LIGHTER_BASE}/api/v1/fundings`;
+
+  const marketKeys = ["market_id", "marketId", "market", "marketID", "marketid"];
+  const countKeys = [
+    ["count_back", 8],
+    ["countBack", 8],
+    ["count", 8],
+    ["limit", 8],
+  ];
+
+  // resolution/timeframe variants (some APIs use these, some reject them => that's fine)
+  const resKeys = [
+    null,
+    ["resolution", 3600],
+    ["resolution", "3600"],
+    ["resolution", "1h"],
+    ["timeframe", "1h"],
+    ["interval", "1h"],
+  ];
+
+  const urls = [];
+  for (const mk of marketKeys) {
+    for (const [ck, cv] of countKeys) {
+      for (const rk of resKeys) {
+        const params = new URLSearchParams();
+        params.set(mk, String(marketId));
+        params.set(ck, String(cv));
+        if (rk) params.set(rk[0], String(rk[1]));
+        urls.push(`${base}?${params.toString()}`);
+      }
+    }
+  }
+
+  // De-dup
+  return Array.from(new Set(urls));
+}
+
+/**
+ * Parse fundings response into array robustly.
+ */
+function normalizeFundingsItems_(data) {
+  const items =
+    Array.isArray(data) ? data :
+    Array.isArray(data?.data) ? data.data :
+    Array.isArray(data?.fundings) ? data.fundings :
+    Array.isArray(data?.items) ? data.items :
+    Array.isArray(data?.result) ? data.result :
+    [];
+  return items;
+}
+
+/**
+ * Fallback funding-rates: pick LAST candidate for strict symbol match.
+ */
+async function lighterFallbackFundingRates_(sym) {
+  const data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`);
+  const items =
+    Array.isArray(data) ? data :
+    Array.isArray(data?.data) ? data.data :
+    Array.isArray(data?.funding_rates) ? data.funding_rates :
+    Array.isArray(data?.fundingRates) ? data.fundingRates :
+    [];
+
+  const cands = [];
+  for (const it of items) {
+    const s = lighterStrictSymbol_(it);
+    if (s !== sym) continue;
+    cands.push(it);
+  }
+  if (!cands.length) return null;
+
+  const picked = cands[cands.length - 1];
+  const rateRaw = lighterGetRateRaw_(picked);
+
   return {
-    rate8h: pts[pts.length - 1].r,
-    method: "last_value",
-    inferredIntervalS,
+    rate8h: rateRaw,
+    candidateCount: cands.length,
+    pickedTs: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
   };
 }
 
 async function getLighter() {
   const rows = [];
 
-  // 1) fundings-based (preferred)
   for (const sym of TARGETS) {
     const marketId = LIGHTER_MARKET_ID[sym];
     if (marketId === undefined || marketId === null) continue;
 
+    // 1) PROBE fundings with many param variants
+    let usedUrl = null;
+    let triedCount = 0;
+    let errorSummary = null;
     let fundings = null;
-    try {
-      // docs seems to use snake_case: market_id, count_back
-      // keep a fallback attempt for camelCase marketId if needed
-      const data = await fetchJsonTry_(
-        [
-          `${LIGHTER_BASE}/api/v1/fundings?market_id=${marketId}&count_back=8`,
-          `${LIGHTER_BASE}/api/v1/fundings?marketId=${marketId}&count_back=8`,
-        ],
-        9000
-      );
 
-      fundings =
-        Array.isArray(data) ? data :
-        Array.isArray(data?.data) ? data.data :
-        Array.isArray(data?.fundings) ? data.fundings :
-        Array.isArray(data?.items) ? data.items :
-        [];
+    const probeUrls = buildLighterFundingsProbeUrls_(marketId);
+    const probe = await fetchJsonProbe_(probeUrls, 9000, 14);
 
-    } catch (e) {
-      // leave null and fallback to funding-rates
-      fundings = null;
+    usedUrl = probe.usedUrl;
+    triedCount = probe.triedCount;
+    errorSummary = probe.errorSummary;
+
+    if (probe.data) {
+      const items = normalizeFundingsItems_(probe.data);
+      if (items && items.length) {
+        fundings = items;
+      }
     }
 
     if (fundings && fundings.length) {
@@ -290,55 +383,45 @@ async function getLighter() {
           funding_interval_s: 28800,
           funding_rate_next_interval: computed.rate8h,
           funding_rate_8h: computed.rate8h,
-          mark_price: null, // will be filled by fillMissingMarks()
+          mark_price: null, // filled later
           source_ts: null,
           raw_symbol: sym,
           lighter_market_id: marketId,
           lighter_source: `fundings:${computed.method}`,
           lighter_candidate_count: fundings.length,
           lighter_inferred_interval_s: computed.inferredIntervalS ?? null,
+          lighter_probe_used_url: usedUrl,
+          lighter_probe_tried: triedCount,
+          lighter_probe_error: errorSummary,
         });
         continue;
       }
     }
 
-    // 2) fallback: funding-rates last-candidate (strict symbol match)
+    // 2) fallback funding-rates:last-candidate
     try {
-      const data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`);
-      const items =
-        Array.isArray(data) ? data :
-        Array.isArray(data?.data) ? data.data :
-        Array.isArray(data?.funding_rates) ? data.funding_rates :
-        Array.isArray(data?.fundingRates) ? data.fundingRates :
-        [];
-
-      const cands = [];
-      for (const it of items) {
-        const s = lighterStrictSymbol_(it);
-        if (s !== sym) continue;
-        cands.push(it);
-      }
-      if (!cands.length) continue;
-
-      const picked = cands[cands.length - 1];
-      const rateRaw = lighterGetRateRaw_(picked);
+      const fb = await lighterFallbackFundingRates_(sym);
+      if (!fb) continue;
 
       rows.push({
         exchange: "lighter",
         symbol: sym,
-        funding_rate_raw: rateRaw,
+        funding_rate_raw: fb.rate8h,
         funding_interval_s: 28800,
-        funding_rate_next_interval: rateRaw,
-        funding_rate_8h: rateRaw,
-        mark_price: null, // will be filled
-        source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
+        funding_rate_next_interval: fb.rate8h,
+        funding_rate_8h: fb.rate8h,
+        mark_price: null, // filled later
+        source_ts: fb.pickedTs,
         raw_symbol: sym,
         lighter_market_id: marketId,
         lighter_source: "funding-rates:last-candidate",
-        lighter_candidate_count: cands.length,
+        lighter_candidate_count: fb.candidateCount,
+        lighter_probe_used_url: usedUrl,
+        lighter_probe_tried: triedCount,
+        lighter_probe_error: errorSummary,
       });
     } catch (e) {
-      // swallow; no lighter row for that symbol
+      // swallow
     }
   }
 
