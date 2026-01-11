@@ -203,101 +203,143 @@ async function lighterFetchLast8HourlyFundings_(marketIndex) {
 }
 
 /** ---------- Lighter (hourly -> 8h equivalent) ---------- */
-async function getLighter() {
-  // 1) perp 마켓 목록에서 심볼별 market_index 확보
-  const perpIndexBySym = new Map();
-  try {
-    const ob = await fetchJson(`${LIGHTER_BASE}/api/v1/orderBookDetails?type=perp`);
-    const obItems =
-      Array.isArray(ob) ? ob :
-      Array.isArray(ob?.data) ? ob.data :
-      Array.isArray(ob?.order_books) ? ob.order_books :
-      Array.isArray(ob?.orderBooks) ? ob.orderBooks :
-      [];
 
-    for (const it of obItems) {
-      const symRaw = lighterGetSymbol_(it);
-      const sym = TARGETS.find((s) => symRaw === s || symRaw.includes(s));
-      if (!sym) continue;
+function lighterExtractMarketId_(it) {
+  const v = pickField(it, ["marketId", "market_id", "marketIndex", "market_index", "id"]);
+  const n = toNum(v);
+  return n === null ? null : n;
+}
 
-      const idx = lighterGetMarketIndex_(it);
-      if (idx === null) continue;
+async function lighterFetchLast8HourlyFundingsByMarketId_(marketId) {
+  const limit = 8;
 
-      // 심볼당 1개만 (라이터는 실질적으로 마켓 1개라는 전제)
-      if (!perpIndexBySym.has(sym)) perpIndexBySym.set(sym, idx);
+  // fundings endpoint 스펙이 애매해서 여러 케이스를 순차 시도
+  const urls = [
+    `${LIGHTER_BASE}/api/v1/fundings?marketId=${marketId}&resolution=1h&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?market_id=${marketId}&resolution=1h&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?marketIndex=${marketId}&resolution=1h&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?market_index=${marketId}&resolution=1h&limit=${limit}`,
+    // resolution 없이도 시도
+    `${LIGHTER_BASE}/api/v1/fundings?marketId=${marketId}&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?market_id=${marketId}&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?marketIndex=${marketId}&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?market_index=${marketId}&limit=${limit}`,
+  ];
+
+  let lastErr = null;
+
+  for (const url of urls) {
+    try {
+      const data = await fetchJson(url);
+
+      const items =
+        Array.isArray(data) ? data :
+        Array.isArray(data?.data) ? data.data :
+        Array.isArray(data?.fundings) ? data.fundings :
+        Array.isArray(data?.rows) ? data.rows :
+        [];
+
+      const rates = items
+        .map((x) => toNum(pickField(x, ["funding_rate", "fundingRate", "rate"])))
+        .filter((x) => x !== null);
+
+      if (rates.length) {
+        const last8 = rates.slice(-limit);
+        return { rates: last8, source: url };
+      }
+    } catch (e) {
+      lastErr = e;
     }
-  } catch (e) {
-    console.log("[lighter] orderBookDetails failed:", String(e?.message || e));
+  }
+
+  throw new Error(
+    `Lighter fundings fetch failed for marketId=${marketId}. lastErr=${String(
+      lastErr?.message ?? lastErr
+    )}`
+  );
+}
+
+async function getLighter() {
+  // 1) funding-rates에서 후보들을 가져온다 (여기서 심볼+marketId를 확보)
+  const data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`);
+
+  const items =
+    Array.isArray(data) ? data :
+    Array.isArray(data?.data) ? data.data :
+    Array.isArray(data?.funding_rates) ? data.funding_rates :
+    Array.isArray(data?.fundingRates) ? data.fundingRates :
+    [];
+
+  // symbol별 후보 모으기 (배열 순서 유지)
+  const candsBySym = new Map();
+  for (const it of items) {
+    const raw = lighterGetSymbol_(it);
+    // 정확 심볼만 통과 (ETHFI/RESOLV 같은 오염 제거)
+    if (!TARGETS.includes(raw)) continue;
+
+    if (!candsBySym.has(raw)) candsBySym.set(raw, []);
+    candsBySym.get(raw).push(it);
   }
 
   const rows = [];
 
-  // 2) 심볼별로 "최근 8시간 hourly funding 합"을 8h 동등값으로 사용
   for (const sym of TARGETS) {
-    const marketIndex = perpIndexBySym.get(sym);
-    if (marketIndex === undefined) continue;
-
-    // 2-a) fundings로 last 8 hourly rate를 받아서 합
-    try {
-      const { rates, source } = await lighterFetchLast8HourlyFundings_(marketIndex);
-      const lastHourly = rates.length ? rates[rates.length - 1] : null;
-      const rate8hEquiv = normalizeLighterTo8hBySumming8Hourly_(rates);
-
-      rows.push({
-        exchange: "lighter",
-        symbol: sym,
-        funding_rate_raw: lastHourly,          // 마지막(가장 최근) hourly rate
-        funding_interval_s: 3600,              // source는 hourly
-        funding_rate_next_interval: lastHourly,
-        funding_rate_8h: rate8hEquiv,          // ✅ 8h 동등값(최근 8개 합)
-        mark_price: null,                      // 아래 fillMissingMarks에서 채움
-        source_ts: null,
-        raw_symbol: sym,
-        lighter_market_index: marketIndex,
-        lighter_source: source,
-      });
-      continue;
-    } catch (e) {
-      console.log(`[lighter] fundings fallback to funding-rates for ${sym}:`, String(e?.message || e));
-    }
-
-    // 2-b) fundings 실패 시: 기존 funding-rates 후보 중 "마지막 1개"를 사용 (fallback)
-    const data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`);
-    const items =
-      Array.isArray(data) ? data :
-      Array.isArray(data?.data) ? data.data :
-      Array.isArray(data?.funding_rates) ? data.funding_rates :
-      Array.isArray(data?.fundingRates) ? data.fundingRates :
-      [];
-
-    const cands = items.filter((it) => {
-      const raw = lighterGetSymbol_(it);
-      const s = TARGETS.find((x) => raw === x || raw.includes(x));
-      return s === sym;
-    });
-
+    const cands = candsBySym.get(sym) || [];
     if (!cands.length) continue;
 
+    // ✅ last candidate 룰
     const picked = cands[cands.length - 1];
-    const rateRaw = lighterGetRateRaw_(picked);
 
+    const marketId = lighterExtractMarketId_(picked) ?? lighterExtractMarketId_(cands[0]);
+    const lastRate = lighterGetRateRaw_(picked);
+
+    // 2) 가능하면 fundings(시간별)로 최근 8개 합산 → 8h 동등값
+    try {
+      if (marketId !== null) {
+        const { rates, source } = await lighterFetchLast8HourlyFundingsByMarketId_(marketId);
+        const rate8hEquiv = rates.reduce((a, b) => a + b, 0);
+
+        rows.push({
+          exchange: "lighter",
+          symbol: sym,
+          funding_rate_raw: lastRate,        // funding-rates에서 본 "최근값"
+          funding_interval_s: 28800,         // 출력 통일용(8h)
+          funding_rate_next_interval: lastRate,
+          funding_rate_8h: rate8hEquiv,      // ✅ 8h 동등값(최근 8개 hourly 합)
+          mark_price: null,
+          source_ts: null,
+          raw_symbol: sym,
+          lighter_market_id: marketId,
+          lighter_source: source,
+          lighter_candidate_count: cands.length,
+        });
+
+        continue;
+      }
+    } catch (e) {
+      console.log(`[lighter] fundings failed, fallback to last candidate (${sym}):`, String(e?.message || e));
+    }
+
+    // 3) fundings 실패 시 fallback: funding-rates의 last candidate 값(너가 확인한 “정확한 값”)
     rows.push({
       exchange: "lighter",
       symbol: sym,
-      funding_rate_raw: rateRaw,
-      funding_interval_s: 28800,              // fallback에서는 8h 취급
-      funding_rate_next_interval: rateRaw,
-      funding_rate_8h: rateRaw,
+      funding_rate_raw: lastRate,
+      funding_interval_s: 28800,
+      funding_rate_next_interval: lastRate,
+      funding_rate_8h: lastRate,
       mark_price: null,
       source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
-      raw_symbol: lighterGetSymbol_(picked) || null,
-      lighter_market_index: lighterGetMarketIndex_(picked),
-      lighter_source: "funding-rates:fallback-last",
+      raw_symbol: lighterGetSymbol_(picked) || sym,
+      lighter_market_id: marketId,
+      lighter_source: "funding-rates:last-candidate",
+      lighter_candidate_count: cands.length,
     });
   }
 
   return rows;
 }
+
 
 /** ---------- marks fallback ---------- */
 function fillMissingMarks(rows) {
