@@ -129,6 +129,35 @@ async function getBinance() {
  * So DO NOT multiply by 8.
  */
 async function getLighter() {
+  // 1) perp 마켓 목록에서 BTC/ETH/SOL/BNB의 market_index 확보 (가능하면 정확매칭용)
+  let perpIndexBySym = new Map();
+
+  try {
+    const ob = await fetchJson(`${LIGHTER_BASE}/api/v1/orderBookDetails?type=perp`);
+
+    const obItems =
+      Array.isArray(ob) ? ob :
+      Array.isArray(ob?.data) ? ob.data :
+      Array.isArray(ob?.order_books) ? ob.order_books :
+      Array.isArray(ob?.orderBooks) ? ob.orderBooks :
+      [];
+
+    for (const it of obItems) {
+      const symRaw = lighterGetSymbol_(it);
+      const sym = TARGETS.find((s) => symRaw === s || symRaw.includes(`${s}`));
+      if (!sym) continue;
+
+      const idx = lighterGetMarketIndex_(it);
+      if (idx === null) continue;
+
+      // 심볼당 첫 perp index만 저장 (라이터 마켓 1개라면 이게 정답)
+      if (!perpIndexBySym.has(sym)) perpIndexBySym.set(sym, idx);
+    }
+  } catch (e) {
+    console.log("[lighter] orderBookDetails failed:", String(e?.message || e));
+  }
+
+  // 2) funding-rates
   const data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`);
 
   const items =
@@ -138,53 +167,60 @@ async function getLighter() {
     Array.isArray(data?.fundingRates) ? data.fundingRates :
     [];
 
+  // symbol별 후보 모으기
+  const candsBySym = new Map();
+  for (const it of items) {
+    const rawSym = lighterGetSymbol_(it);
+    const sym = TARGETS.find((s) => rawSym === s || rawSym.includes(`${s}`));
+    if (!sym) continue;
+
+    if (!candsBySym.has(sym)) candsBySym.set(sym, []);
+    candsBySym.get(sym).push(it);
+  }
+
   const rows = [];
 
-  for (const it of items) {
-    const rawSym = String(
-      pickField(it, ["symbol", "ticker", "market", "marketSymbol", "name"]) || ""
-    ).toUpperCase();
+  for (const sym of TARGETS) {
+    const cands = candsBySym.get(sym) || [];
+    if (!cands.length) continue;
 
-    // ✅ "BTC" "ETH" "SOL" "BNB" 정확히 매칭만 허용 (ETHFI, RESOLV 같은 거 배제)
-    if (!TARGETS.includes(rawSym)) continue;
-    const sym = rawSym;
+    const wantedIdx = perpIndexBySym.get(sym);
 
-    // field candidates (some APIs name is misleading - treat returned value as 8h)
-    const rateKeyCandidates = [
-      "funding_rate_8h",
-      "fundingRate8h",
-      "funding_rate",
-      "fundingRate",
-      "rate",
-      "hourly_funding_rate",
-      "hourlyFundingRate",
-    ];
-
-    let rateRaw = null;
-    for (const k of rateKeyCandidates) {
-      if (it && it[k] !== undefined && it[k] !== null) {
-        rateRaw = toNum(it[k]);
-        break;
-      }
+    // 2-1) market_index로 정확 매칭 우선
+    let picked = null;
+    if (wantedIdx !== undefined) {
+      picked = cands.find((it) => lighterGetMarketIndex_(it) === wantedIdx) || null;
     }
 
-    // ✅ treat rateRaw as 8h-equivalent funding
-    const rate8h = rateRaw;
+    // 2-2) 매칭 실패하면 ✅ "마지막 1개" 선택
+    if (!picked) {
+      console.log(
+        `[lighter] fallback LAST pick for ${sym}. wantedIdx=${wantedIdx}, candCount=${cands.length}`
+      );
+      const idxs = cands.map((x) => lighterGetMarketIndex_(x));
+      console.log(`[lighter] ${sym} candidate market_index list:`, JSON.stringify(idxs));
+
+      picked = cands[cands.length - 1];
+    }
+
+    const rateRaw = lighterGetRateRaw_(picked);
+    const interval = lighterGetIntervalS_(picked);
+    const mark = toNum(pickField(picked, ["mark_price", "markPrice", "mark"]));
 
     rows.push({
       exchange: "lighter",
       symbol: sym,
       funding_rate_raw: rateRaw,
-      funding_interval_s: 28800,          // output normalized to 8h
-      funding_rate_next_interval: rate8h,
-      funding_rate_8h: rate8h,
-      mark_price: toNum(pickField(it, ["mark_price", "markPrice", "mark"])), // might be null
-      source_ts: pickField(it, ["timestamp", "ts", "updated_at"]) ?? null,
-      raw_symbol: rawSym || null,
+      funding_interval_s: interval,
+      funding_rate_next_interval: rateRaw,
+      funding_rate_8h: normalizeTo8h(rateRaw, interval),
+      mark_price: mark,
+      source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
+      raw_symbol: lighterGetSymbol_(picked) || null,
+      lighter_market_index: lighterGetMarketIndex_(picked),
     });
   }
 
-  rows.sort((a, b) => TARGETS.indexOf(a.symbol) - TARGETS.indexOf(b.symbol));
   return rows;
 }
 
