@@ -28,6 +28,14 @@ function annualTo8h(annualRate) {
   return r / (365 * 3);
 }
 
+// interval_s 기반 8h 환산 (필요 시만)
+function normalizeTo8h(rate, interval_s) {
+  const r = toNum(rate);
+  const s = toNum(interval_s);
+  if (r === null || s === null || s <= 0) return null;
+  return r * (28800 / s);
+}
+
 async function fetchJson(url, timeoutMs = 8000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -71,10 +79,10 @@ async function getVariational() {
     rows.push({
       exchange: "variational",
       symbol: sym,
-      funding_rate_raw: rateAnnual,            // annual
-      funding_interval_s: 28800,               // normalize output to 8h
-      funding_rate_next_interval: rate8h,      // next 8h
-      funding_rate_8h: rate8h,                 // 8h normalized
+      funding_rate_raw: rateAnnual, // annual
+      funding_interval_s: 28800, // normalize output to 8h
+      funding_rate_next_interval: rate8h,
+      funding_rate_8h: rate8h,
       mark_price: toNum(it.mark_price),
       source_ts: it?.quotes?.updated_at ?? null,
     });
@@ -125,39 +133,55 @@ async function getBinance() {
 }
 
 /** ---------------- Lighter ----------------
- * IMPORTANT: Lighter /funding-rates is treated as already "8h equivalent" rate.
- * So DO NOT multiply by 8.
+ * NOTE:
+ * - Your observation: the LAST entry per symbol is the correct one.
+ * - So we group by symbol and keep only the last candidate.
+ * - We treat Lighter returned rate as already 8h-equivalent (interval_s=28800).
  */
-async function getLighter() {
-  // 1) perp 마켓 목록에서 BTC/ETH/SOL/BNB의 market_index 확보 (가능하면 정확매칭용)
-  let perpIndexBySym = new Map();
+function lighterExtractSymbol_(it) {
+  const raw = String(
+    pickField(it, ["symbol", "ticker", "market", "marketSymbol", "name", "base"]) || ""
+  ).toUpperCase();
 
-  try {
-    const ob = await fetchJson(`${LIGHTER_BASE}/api/v1/orderBookDetails?type=perp`);
+  // exact match only: BTC/ETH/SOL/BNB
+  if (TARGETS.includes(raw)) return raw;
 
-    const obItems =
-      Array.isArray(ob) ? ob :
-      Array.isArray(ob?.data) ? ob.data :
-      Array.isArray(ob?.order_books) ? ob.order_books :
-      Array.isArray(ob?.orderBooks) ? ob.orderBooks :
-      [];
-
-    for (const it of obItems) {
-      const symRaw = lighterGetSymbol_(it);
-      const sym = TARGETS.find((s) => symRaw === s || symRaw.includes(`${s}`));
-      if (!sym) continue;
-
-      const idx = lighterGetMarketIndex_(it);
-      if (idx === null) continue;
-
-      // 심볼당 첫 perp index만 저장 (라이터 마켓 1개라면 이게 정답)
-      if (!perpIndexBySym.has(sym)) perpIndexBySym.set(sym, idx);
+  // some APIs may use "BTC-PERP" or "BTC_PERP" etc.
+  for (const s of TARGETS) {
+    if (raw === s) return s;
+    if (raw.startsWith(s + "-") || raw.startsWith(s + "_") || raw === s + "PERP" || raw.includes(`${s}-PERP`) || raw.includes(`${s}_PERP`)) {
+      return s;
     }
-  } catch (e) {
-    console.log("[lighter] orderBookDetails failed:", String(e?.message || e));
   }
 
-  // 2) funding-rates
+  return null;
+}
+
+function lighterExtractRate_(it) {
+  // candidates (we will treat the extracted number as 8h funding)
+  const keys = [
+    "funding_rate_8h",
+    "fundingRate8h",
+    "funding_rate",
+    "fundingRate",
+    "rate",
+    "nextFundingRate",
+    "next_funding_rate",
+    "hourly_funding_rate",
+    "hourlyFundingRate",
+  ];
+
+  for (const k of keys) {
+    const v = pickField(it, [k]);
+    if (v !== null && v !== undefined) {
+      const n = toNum(v);
+      if (n !== null) return n;
+    }
+  }
+  return null;
+}
+
+async function getLighter() {
   const data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`);
 
   const items =
@@ -167,57 +191,35 @@ async function getLighter() {
     Array.isArray(data?.fundingRates) ? data.fundingRates :
     [];
 
-  // symbol별 후보 모으기
-  const candsBySym = new Map();
+  // keep last item per symbol (based on array order)
+  const lastBySym = new Map();
+
   for (const it of items) {
-    const rawSym = lighterGetSymbol_(it);
-    const sym = TARGETS.find((s) => rawSym === s || rawSym.includes(`${s}`));
+    const sym = lighterExtractSymbol_(it);
     if (!sym) continue;
 
-    if (!candsBySym.has(sym)) candsBySym.set(sym, []);
-    candsBySym.get(sym).push(it);
+    // IMPORTANT: keep overwriting so the last one remains
+    lastBySym.set(sym, it);
   }
 
   const rows = [];
-
   for (const sym of TARGETS) {
-    const cands = candsBySym.get(sym) || [];
-    if (!cands.length) continue;
+    const picked = lastBySym.get(sym);
+    if (!picked) continue;
 
-    const wantedIdx = perpIndexBySym.get(sym);
-
-    // 2-1) market_index로 정확 매칭 우선
-    let picked = null;
-    if (wantedIdx !== undefined) {
-      picked = cands.find((it) => lighterGetMarketIndex_(it) === wantedIdx) || null;
-    }
-
-    // 2-2) 매칭 실패하면 ✅ "마지막 1개" 선택
-    if (!picked) {
-      console.log(
-        `[lighter] fallback LAST pick for ${sym}. wantedIdx=${wantedIdx}, candCount=${cands.length}`
-      );
-      const idxs = cands.map((x) => lighterGetMarketIndex_(x));
-      console.log(`[lighter] ${sym} candidate market_index list:`, JSON.stringify(idxs));
-
-      picked = cands[cands.length - 1];
-    }
-
-    const rateRaw = lighterGetRateRaw_(picked);
-    const interval = lighterGetIntervalS_(picked);
+    const rate8h = lighterExtractRate_(picked);
     const mark = toNum(pickField(picked, ["mark_price", "markPrice", "mark"]));
 
     rows.push({
       exchange: "lighter",
       symbol: sym,
-      funding_rate_raw: rateRaw,
-      funding_interval_s: interval,
-      funding_rate_next_interval: rateRaw,
-      funding_rate_8h: normalizeTo8h(rateRaw, interval),
+      funding_rate_raw: rate8h,
+      funding_interval_s: 28800,
+      funding_rate_next_interval: rate8h,
+      funding_rate_8h: rate8h, // already 8h
       mark_price: mark,
       source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
-      raw_symbol: lighterGetSymbol_(picked) || null,
-      lighter_market_index: lighterGetMarketIndex_(picked),
+      raw_symbol: String(pickField(picked, ["symbol", "ticker", "market", "marketSymbol", "name"]) || sym),
     });
   }
 
@@ -258,7 +260,6 @@ export default async function handler(req, res) {
     const rows = [...v, ...b, ...l];
     fillMissingMarks(rows);
 
-    // Apps Script 호출 대비 캐시
     res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=60");
     res.setHeader("Access-Control-Allow-Origin", "*");
 
