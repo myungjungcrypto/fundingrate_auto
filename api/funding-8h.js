@@ -191,21 +191,25 @@ async function getLighter() {
     Array.isArray(data?.fundingRates) ? data.fundingRates :
     [];
 
-  // keep last item per symbol (based on array order)
-  const lastBySym = new Map();
-
+  // candidates per symbol (in array order)
+  const candsBySym = new Map();
   for (const it of items) {
     const sym = lighterExtractSymbol_(it);
     if (!sym) continue;
-
-    // IMPORTANT: keep overwriting so the last one remains
-    lastBySym.set(sym, it);
+    if (!candsBySym.has(sym)) candsBySym.set(sym, []);
+    candsBySym.get(sym).push(it);
   }
 
+  // keep LAST per symbol
   const rows = [];
+  const debug = {};
+
   for (const sym of TARGETS) {
-    const picked = lastBySym.get(sym);
-    if (!picked) continue;
+    const cands = candsBySym.get(sym) || [];
+    if (!cands.length) continue;
+
+    const pickedIdx = cands.length - 1;
+    const picked = cands[pickedIdx];
 
     const rate8h = lighterExtractRate_(picked);
     const mark = toNum(pickField(picked, ["mark_price", "markPrice", "mark"]));
@@ -216,15 +220,30 @@ async function getLighter() {
       funding_rate_raw: rate8h,
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
-      funding_rate_8h: rate8h, // already 8h
+      funding_rate_8h: rate8h,
       mark_price: mark,
       source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
       raw_symbol: String(pickField(picked, ["symbol", "ticker", "market", "marketSymbol", "name"]) || sym),
     });
+
+    // ---- debug snapshot (trim to important fields only) ----
+    debug[sym] = {
+      candidateCount: cands.length,
+      pickedIndex: pickedIdx,
+      candidates: cands.map((x, i) => {
+        const rawSymbol = String(pickField(x, ["symbol","ticker","market","marketSymbol","name"]) || "");
+        const rate = lighterExtractRate_(x);
+        const mi = pickField(x, ["market_index","marketIndex","market_id","marketId","id"]);
+        const mk = toNum(pickField(x, ["mark_price","markPrice","mark"]));
+        const ts = pickField(x, ["timestamp","ts","updated_at","updatedAt"]);
+        return { i, rawSymbol, marketId: mi ?? null, rate, mark: mk ?? null, ts: ts ?? null };
+      }),
+    };
   }
 
-  return rows;
+  return { rows, debug };
 }
+
 
 function fillMissingMarks(rows) {
   // Prefer binance marks as fallback, then variational
@@ -250,20 +269,25 @@ function fillMissingMarks(rows) {
 export default async function handler(req, res) {
   try {
     const asOf = new Date().toISOString();
+    const debugOn = String(req.query?.debug || "") === "1";
 
-    const [v, b, l] = await Promise.all([
+    const [v, b, lighter] = await Promise.all([
       getVariational(),
       getBinance(),
-      getLighter(),
+      getLighter(), // now returns { rows, debug }
     ]);
 
+    const l = lighter.rows;
     const rows = [...v, ...b, ...l];
     fillMissingMarks(rows);
 
     res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=60");
     res.setHeader("Access-Control-Allow-Origin", "*");
 
-    res.status(200).json({ asOf, rows });
+    const payload = { asOf, rows };
+    if (debugOn) payload.lighter_debug = lighter.debug;
+
+    res.status(200).json(payload);
   } catch (e) {
     res.status(500).json({ error: String(e?.message ?? e) });
   }
