@@ -1,11 +1,19 @@
 // api/funding-8h.js
-// Aggregates funding/mark from Variational, Binance, Lighter.
-// - Variational funding_rate is ANNUAL -> convert to 8h
-// - Binance fundingRate is 8h realized
-// - Lighter: prefer /fundings (hourly) -> sum last 8 hours as 8h-equivalent
-//           fallback to /funding-rates "last candidate" if /fundings fails
-// - Adds retry + partial errors so one exchange failure doesn't break the whole response
-// - Optional debug: add ?debug=1 to include lighter_debug in response
+// Aggregates funding/mark from Variational, Binance, Lighter and normalizes to 8h.
+//
+// Output rows fields (stable):
+// - exchange, symbol
+// - funding_rate_raw (source-native; for Lighter = last hourly rate)
+// - funding_interval_s (we normalize to 28800 for all exchanges)
+// - funding_rate_next_interval
+// - funding_rate_8h
+// - mark_price
+// - source_ts
+//
+// Lighter special:
+// - Uses /api/v1/fundings?resolution=1h&count_back=8 (or fallback param variants)
+// - Sums last 8 hourly funding rates => funding_rate_8h (trailing 8h sum)
+// - market_id mapping from your debug: BTC=1, ETH=0, SOL=2, BNB=25
 
 const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
 
@@ -21,11 +29,13 @@ const VARIATIONAL_BASE =
 
 const LIGHTER_BASE = "https://mainnet.zklighter.elliot.ai";
 
-/** ---------------- helpers ---------------- */
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+// ✅ market_id 매핑(네 디버그 값 기반)
+const LIGHTER_MARKET_ID = {
+  BTC: 1,
+  ETH: 0,
+  SOL: 2,
+  BNB: 25,
+};
 
 function toNum(x) {
   if (x === null || x === undefined) return null;
@@ -40,68 +50,37 @@ function pickField(obj, keys) {
   return null;
 }
 
-// Variational funding_rate is annual fraction (e.g. 0.1095 = 10.95% APR annual)
-// Convert to 8h window: 365 days * 3 windows/day = 1095 windows/year
 function annualTo8h(annualRate) {
   const r = toNum(annualRate);
   if (r === null) return null;
+  // 1 year ≈ 365 days, 3 funding windows/day => 1095 windows/year
   return r / (365 * 3);
 }
 
-async function fetchJson(url, timeoutMs = 10000, retries = 2) {
-  let lastErr = null;
-
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const resp = await fetch(url, { signal: controller.signal });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status} ${url}`);
-      return await resp.json();
-    } catch (e) {
-      lastErr = e;
-      if (attempt < retries) {
-        await sleep(250 * (attempt + 1));
-      }
-    } finally {
-      clearTimeout(t);
-    }
-  }
-
-  throw lastErr;
+function normalizeTo8h(rate, interval_s) {
+  const r = toNum(rate);
+  const s = toNum(interval_s);
+  if (r === null || s === null || s <= 0) return null;
+  return r * (28800 / s);
 }
 
-function extractArrayCandidates(data) {
-  const arr =
-    Array.isArray(data) ? data :
-    Array.isArray(data?.data) ? data.data :
-    Array.isArray(data?.funding_rates) ? data.funding_rates :
-    Array.isArray(data?.fundingRates) ? data.fundingRates :
-    Array.isArray(data?.data?.funding_rates) ? data.data.funding_rates :
-    Array.isArray(data?.data?.fundingRates) ? data.data.fundingRates :
-    null;
-
-  if (arr) return arr;
-
-  // Sometimes APIs return a map/object → use Object.values
-  if (data && typeof data === "object") {
-    const vals = Object.values(data);
-    if (vals.every((v) => v && typeof v === "object")) return vals;
-
-    if (data.data && typeof data.data === "object") {
-      const vals2 = Object.values(data.data);
-      if (vals2.every((v) => v && typeof v === "object")) return vals2;
-    }
+async function fetchJson(url, timeoutMs = 9000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { signal: controller.signal });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${url}`);
+    return await resp.json();
+  } finally {
+    clearTimeout(t);
   }
-  return [];
 }
 
 /** ---------------- Variational ----------------
  * stats.listings[]: ticker, funding_rate(ANNUAL), funding_interval_s, mark_price, quotes.updated_at
  */
 async function getVariational() {
-  const stats = await fetchJson(`${VARIATIONAL_BASE}/metadata/stats`, 12000, 2);
+  const stats = await fetchJson(`${VARIATIONAL_BASE}/metadata/stats`);
   const listings = Array.isArray(stats?.listings) ? stats.listings : [];
 
   const byTicker = new Map();
@@ -121,10 +100,10 @@ async function getVariational() {
     rows.push({
       exchange: "variational",
       symbol: sym,
-      funding_rate_raw: rateAnnual, // annual
-      funding_interval_s: 28800,
-      funding_rate_next_interval: rate8h,
-      funding_rate_8h: rate8h,
+      funding_rate_raw: rateAnnual,       // annual
+      funding_interval_s: 28800,          // normalized output to 8h
+      funding_rate_next_interval: rate8h, // next 8h
+      funding_rate_8h: rate8h,            // 8h
       mark_price: toNum(it.mark_price),
       source_ts: it?.quotes?.updated_at ?? null,
     });
@@ -132,17 +111,16 @@ async function getVariational() {
   return rows;
 }
 
-/** ---------------- Binance (8h realized) ---------------- */
+/** ---------------- Binance (8h) ---------------- */
 async function getBinance() {
   const rows = [];
 
   for (const sym of TARGETS) {
     const fSym = BINANCE_SYMBOLS[sym];
 
+    // latest realized 8h funding rate
     const fundingArr = await fetchJson(
-      `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${fSym}&limit=1`,
-      12000,
-      2
+      `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${fSym}&limit=1`
     );
     const last =
       Array.isArray(fundingArr) && fundingArr.length
@@ -154,10 +132,9 @@ async function getBinance() {
       ? new Date(Number(last.fundingTime)).toISOString()
       : null;
 
+    // mark price
     const prem = await fetchJson(
-      `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${fSym}`,
-      12000,
-      2
+      `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${fSym}`
     );
     const mark = toNum(prem?.markPrice);
 
@@ -176,184 +153,180 @@ async function getBinance() {
   return rows;
 }
 
-/** ---------------- Lighter ---------------- */
+/** ---------------- Lighter helpers ---------------- */
 
-function lighterExtractSymbol_(it) {
+function lighterGetSymbol_(it) {
   const raw = pickField(it, ["symbol", "ticker", "market", "marketSymbol", "name"]);
   return String(raw || "").toUpperCase();
 }
 
-function lighterExtractRate_(it) {
-  const v = pickField(it, [
-    "rate",
-    "funding_rate",
-    "fundingRate",
-    "hourly_funding_rate",
-    "hourlyFundingRate",
-  ]);
-  return toNum(v);
-}
-
-function lighterExtractMarketId_(it) {
-  const v = pickField(it, ["marketId", "market_id", "marketIndex", "market_index", "id"]);
+function lighterGetMarketId_(it) {
+  const v = pickField(it, ["market_id", "marketId", "market_index", "marketIndex", "market"]);
   const n = toNum(v);
   return n === null ? null : n;
 }
 
-async function lighterFetchLast8HourlyFundingsByMarketId_(marketId) {
-  const limit = 8;
+function lighterGetRateRaw_(it) {
+  // funding rate key candidates (hourly/instant)
+  const v = pickField(it, [
+    "funding_rate",
+    "fundingRate",
+    "rate",
+    "hourly_funding_rate",
+    "hourlyFundingRate",
+    "funding",
+  ]);
+  return toNum(v);
+}
 
-  // Try multiple param spellings for robustness
-  const urls = [
-    `${LIGHTER_BASE}/api/v1/fundings?marketId=${marketId}&resolution=1h&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?market_id=${marketId}&resolution=1h&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?marketIndex=${marketId}&resolution=1h&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?market_index=${marketId}&resolution=1h&limit=${limit}`,
+function lighterGetTs_(it) {
+  const v = pickField(it, ["timestamp", "ts", "time", "updated_at", "updatedAt"]);
+  if (v === null || v === undefined) return null;
+  // could be millis
+  const n = toNum(v);
+  if (n !== null && n > 10_000_000_000) {
+    try {
+      return new Date(n).toISOString();
+    } catch (_) {}
+  }
+  return String(v);
+}
 
-    // without resolution
-    `${LIGHTER_BASE}/api/v1/fundings?marketId=${marketId}&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?market_id=${marketId}&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?marketIndex=${marketId}&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?market_index=${marketId}&limit=${limit}`,
+function unwrapArray_(data) {
+  return Array.isArray(data)
+    ? data
+    : Array.isArray(data?.data)
+    ? data.data
+    : Array.isArray(data?.fundings)
+    ? data.fundings
+    : Array.isArray(data?.items)
+    ? data.items
+    : [];
+}
+
+/**
+ * Try multiple param variants because some docs render dynamically / param names can differ.
+ * We want: last 8 items at 1h resolution for a specific market_id.
+ */
+async function lighterFetchFundings1h_(marketId, countBack = 8) {
+  const qsCandidates = [
+    // user's preferred
+    `market_id=${marketId}&resolution=1h&count_back=${countBack}`,
+    `market_id=${marketId}&resolution=1h&countBack=${countBack}`,
+    `market_id=${marketId}&resolution=1h&count=${countBack}`,
+    `market_id=${marketId}&resolution=1h&limit=${countBack}`,
+
+    // sometimes resolution is seconds
+    `market_id=${marketId}&resolution=3600&count_back=${countBack}`,
+    `market_id=${marketId}&resolution=3600&countBack=${countBack}`,
+    `market_id=${marketId}&resolution=3600&count=${countBack}`,
+    `market_id=${marketId}&resolution=3600&limit=${countBack}`,
+
+    // sometimes marketId casing
+    `marketId=${marketId}&resolution=1h&count_back=${countBack}`,
+    `marketId=${marketId}&resolution=3600&count_back=${countBack}`,
   ];
 
   let lastErr = null;
 
-  for (const url of urls) {
+  for (const qs of qsCandidates) {
+    const url = `${LIGHTER_BASE}/api/v1/fundings?${qs}`;
     try {
-      const data = await fetchJson(url, 12000, 1);
-      const items =
-        Array.isArray(data) ? data :
-        Array.isArray(data?.data) ? data.data :
-        Array.isArray(data?.fundings) ? data.fundings :
-        Array.isArray(data?.rows) ? data.rows :
-        [];
-
-      const rates = items
-        .map((x) => toNum(pickField(x, ["funding_rate", "fundingRate", "rate"])))
-        .filter((x) => x !== null);
-
-      if (rates.length) {
-        // keep last N in case the API returns more
-        const lastN = rates.slice(-limit);
-        return { rates: lastN, source: url };
+      const data = await fetchJson(url);
+      const items = unwrapArray_(data);
+      if (items.length) {
+        return { urlTried: url, items };
       }
+      // empty array is also "success but no data" -> still try next
     } catch (e) {
       lastErr = e;
+      // try next candidate
     }
   }
 
   throw new Error(
-    `Lighter fundings fetch failed for marketId=${marketId}. lastErr=${String(
-      lastErr?.message ?? lastErr
+    `[lighter] fundings fetch failed (marketId=${marketId}). lastErr=${String(
+      lastErr?.message || lastErr
     )}`
   );
 }
 
-async function getLighter(debugOn = false) {
-  // Cache-bust to avoid edge caching weirdness
-  const data = await fetchJson(
-    `${LIGHTER_BASE}/api/v1/funding-rates?t=${Date.now()}`,
-    12000,
-    2
-  );
-
-  const items = extractArrayCandidates(data);
-
-  // Group candidates by exact symbol (avoid ETHFI / RESOLV contamination)
-  const candsBySym = new Map();
-  for (const it of items) {
-    const symRaw = lighterExtractSymbol_(it);
-    if (!TARGETS.includes(symRaw)) continue;
-
-    if (!candsBySym.has(symRaw)) candsBySym.set(symRaw, []);
-    candsBySym.get(symRaw).push(it);
-  }
-
+async function getLighter({ debug = false } = {}) {
   const rows = [];
-  const lighter_debug = {};
+  const debugObj = {};
 
   for (const sym of TARGETS) {
-    const cands = candsBySym.get(sym) || [];
-    if (!cands.length) continue;
+    const marketId = LIGHTER_MARKET_ID[sym];
+    if (marketId === undefined || marketId === null) continue;
 
-    const pickedIdx = cands.length - 1;
-    const picked = cands[pickedIdx];
+    // 1) pull last 8 hourly fundings
+    const { urlTried, items } = await lighterFetchFundings1h_(marketId, 8);
 
-    const marketId =
-      lighterExtractMarketId_(picked) ??
-      lighterExtractMarketId_(cands[0]) ??
-      null;
-
-    const lastCandidateRate = lighterExtractRate_(picked);
-
-    // Debug snapshot
-    if (debugOn) {
-      lighter_debug[sym] = {
-        candidateCount: cands.length,
-        pickedIndex: pickedIdx,
-        candidates: cands.map((x, i) => {
-          const rawSymbol = lighterExtractSymbol_(x);
-          const rate = lighterExtractRate_(x);
-          const mi = lighterExtractMarketId_(x);
-          const mk = toNum(pickField(x, ["mark_price", "markPrice", "mark"]));
-          const ts = pickField(x, ["timestamp", "ts", "updated_at", "updatedAt"]);
-          return { i, rawSymbol, marketId: mi, rate, mark: mk ?? null, ts: ts ?? null };
-        }),
+    // 2) normalize ordering if timestamps exist; else keep as given
+    const enriched = items.map((it, i) => {
+      const rawSymbol = lighterGetSymbol_(it) || sym;
+      return {
+        i,
+        rawSymbol,
+        marketId: lighterGetMarketId_(it),
+        rate: lighterGetRateRaw_(it),
+        ts: lighterGetTs_(it),
+        mark: toNum(pickField(it, ["mark_price", "markPrice", "mark"])),
       };
-    }
+    });
 
-    // Try /fundings to compute 8h-equivalent via sum(last 8 hourly)
-    if (marketId !== null) {
-      try {
-        const { rates, source } = await lighterFetchLast8HourlyFundingsByMarketId_(marketId);
-        const sum8h = rates.reduce((a, b) => a + b, 0);
+    // If timestamps look sortable, sort ascending by ts (best effort)
+    const withSortableTs = enriched.every((x) => x.ts);
+    const ordered = withSortableTs
+      ? [...enriched].sort((a, b) => String(a.ts).localeCompare(String(b.ts)))
+      : enriched;
 
-        rows.push({
-          exchange: "lighter",
-          symbol: sym,
-          funding_rate_raw: lastCandidateRate, // last-candidate (matches UI more often)
-          funding_interval_s: 28800, // normalize output to 8h
-          funding_rate_next_interval: lastCandidateRate,
-          funding_rate_8h: sum8h, // ✅ 8h equivalent from hourly history
-          mark_price: null,
-          source_ts: null,
-          raw_symbol: sym,
-          lighter_market_id: marketId,
-          lighter_source: source,
-          lighter_candidate_count: cands.length,
-        });
+    // Take last 8 (or fewer if API returned fewer)
+    const lastN = ordered.slice(Math.max(0, ordered.length - 8));
 
-        continue;
-      } catch (e) {
-        console.log(
-          `[lighter] fundings failed -> fallback to funding-rates:last-candidate (${sym}, marketId=${marketId}):`,
-          String(e?.message || e)
-        );
-      }
-    }
+    // Sum of last 8 hourly rates => trailing 8h equivalent
+    const rates = lastN.map((x) => toNum(x.rate)).filter((x) => x !== null);
+    const sum8h =
+      rates.length > 0 ? rates.reduce((acc, v) => acc + v, 0) : null;
 
-    // Fallback: last candidate from funding-rates
+    const lastHourly = rates.length ? rates[rates.length - 1] : null;
+
+    // Mark price may not exist in fundings -> we fill later with Binance marks
+    const markCandidate = lastN.length ? lastN[lastN.length - 1].mark : null;
+    const tsCandidate = lastN.length ? lastN[lastN.length - 1].ts : null;
+
     rows.push({
       exchange: "lighter",
       symbol: sym,
-      funding_rate_raw: lastCandidateRate,
-      funding_interval_s: 28800,
-      funding_rate_next_interval: lastCandidateRate,
-      funding_rate_8h: lastCandidateRate,
-      mark_price: null,
-      source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
-      raw_symbol: lighterExtractSymbol_(picked) || sym,
+      funding_rate_raw: lastHourly, // last hourly rate (debug-friendly)
+      funding_interval_s: 28800, // normalize output to 8h
+      funding_rate_next_interval: sum8h,
+      funding_rate_8h: sum8h,
+      mark_price: markCandidate,
+      source_ts: tsCandidate,
+      raw_symbol: sym,
       lighter_market_id: marketId,
-      lighter_source: "funding-rates:last-candidate",
-      lighter_candidate_count: cands.length,
+      lighter_source: "fundings:sum8x1h",
+      lighter_fundings_url: urlTried,
+      lighter_points_used: lastN.length,
     });
+
+    if (debug) {
+      debugObj[sym] = {
+        marketId,
+        urlTried,
+        returned: enriched.length,
+        used: lastN.length,
+        usedRates: lastN.map((x) => x.rate),
+        usedTs: lastN.map((x) => x.ts),
+        sum8h,
+      };
+    }
   }
 
-  return debugOn ? { rows, lighter_debug } : { rows };
+  return { rows, debugObj };
 }
 
-/** ---------------- marks fallback ---------------- */
 function fillMissingMarks(rows) {
   // Prefer binance marks as fallback, then variational
   const markBySymbol = new Map();
@@ -375,51 +348,29 @@ function fillMissingMarks(rows) {
   }
 }
 
-/** ---------------- handler ---------------- */
 export default async function handler(req, res) {
-  const asOf = new Date().toISOString();
-  const debugOn = String(req.query?.debug || "") === "1";
+  try {
+    const asOf = new Date().toISOString();
+    const debug = String(req?.query?.debug || "") === "1";
 
-  const errors = [];
+    const [v, b, l] = await Promise.all([
+      getVariational(),
+      getBinance(),
+      getLighter({ debug }),
+    ]);
 
-  const settled = await Promise.allSettled([
-    getVariational(),
-    getBinance(),
-    getLighter(debugOn),
-  ]);
+    const rows = [...v, ...b, ...l.rows];
+    fillMissingMarks(rows);
 
-  const [vRes, bRes, lRes] = settled;
+    // Apps Script 호출 대비 캐시
+    res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=60");
+    res.setHeader("Access-Control-Allow-Origin", "*");
 
-  const v =
-    vRes.status === "fulfilled"
-      ? vRes.value
-      : (errors.push({ exchange: "variational", error: String(vRes.reason) }), []);
+    const payload = { asOf, rows };
+    if (debug) payload.lighter_debug = l.debugObj;
 
-  const b =
-    bRes.status === "fulfilled"
-      ? bRes.value
-      : (errors.push({ exchange: "binance", error: String(bRes.reason) }), []);
-
-  let lRows = [];
-  let lighter_debug = undefined;
-
-  if (lRes.status === "fulfilled") {
-    lRows = Array.isArray(lRes.value?.rows) ? lRes.value.rows : [];
-    if (debugOn && lRes.value?.lighter_debug) lighter_debug = lRes.value.lighter_debug;
-  } else {
-    errors.push({ exchange: "lighter", error: String(lRes.reason) });
+    res.status(200).json(payload);
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message ?? e) });
   }
-
-  const rows = [...v, ...b, ...lRows];
-  fillMissingMarks(rows);
-
-  // Apps Script 대비 캐시 + CORS
-  res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=60");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-
-  const payload = { asOf, rows };
-  if (errors.length) payload.errors = errors;
-  if (debugOn && lighter_debug) payload.lighter_debug = lighter_debug;
-
-  res.status(200).json(payload);
 }
