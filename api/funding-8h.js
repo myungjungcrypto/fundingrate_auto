@@ -1,6 +1,5 @@
 // api/funding-8h.js
 // Aggregates funding/mark from Variational, Binance, Lighter and normalizes to 8h.
-// Lighter policy: 1-call funding-rates + strict symbol + last-candidate.
 
 const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
 
@@ -16,8 +15,6 @@ const VARIATIONAL_BASE =
 
 const LIGHTER_BASE = "https://mainnet.zklighter.elliot.ai";
 
-/** ---------------- utils ---------------- */
-
 function toNum(x) {
   if (x === null || x === undefined) return null;
   const n = Number(x);
@@ -31,7 +28,6 @@ function pickField(obj, keys) {
   return null;
 }
 
-// Variational: annual rate -> 8h
 function annualTo8h(annualRate) {
   const r = toNum(annualRate);
   if (r === null) return null;
@@ -39,30 +35,13 @@ function annualTo8h(annualRate) {
   return r / (365 * 3);
 }
 
-// generic normalize: rate for "interval_s" -> 8h
 function normalizeTo8h(rate, intervalS) {
   const r = toNum(rate);
   const s = toNum(intervalS);
   if (r === null) return null;
-  if (!s || s <= 0) return r; // unknown => assume already 8h-equivalent
-  // If interval is 1h, multiply by 8; if 8h, multiply by 1; etc
+  if (!s || s <= 0) return r; // fallback: assume already 8h-like
+  // if rate is per-interval, scale to 8h
   return r * (28800 / s);
-}
-
-// Symbol normalization for strict match
-// Examples:
-//  - "BTC" -> "BTC"
-//  - "BTC-PERP" -> "BTC"
-//  - "ETH/USDC" -> "ETH"
-//  - "ETHFI" -> "ETHFI" (won't match "ETH")
-function normalizeSymbol(raw) {
-  if (raw === null || raw === undefined) return "";
-  const s = String(raw).trim().toUpperCase();
-  if (!s) return "";
-  // split on common separators
-  const first = s.split(/[\s\-_/.:]+/)[0];
-  // keep alnum only
-  return first.replace(/[^A-Z0-9]/g, "");
 }
 
 async function fetchJson(url, timeoutMs = 8000) {
@@ -86,7 +65,7 @@ async function getVariational() {
 
   const byTicker = new Map();
   for (const it of listings) {
-    const t = normalizeSymbol(it?.ticker);
+    const t = String(it?.ticker || "").toUpperCase();
     if (TARGETS.includes(t)) byTicker.set(t, it);
   }
 
@@ -104,7 +83,7 @@ async function getVariational() {
       funding_rate_raw: rateAnnual,       // annual
       funding_interval_s: 28800,          // normalize output to 8h
       funding_rate_next_interval: rate8h, // next 8h
-      funding_rate_8h: rate8h,
+      funding_rate_8h: rate8h,            // 8h normalized
       mark_price: toNum(it.mark_price),
       source_ts: it?.quotes?.updated_at ?? null,
     });
@@ -112,42 +91,37 @@ async function getVariational() {
   return rows;
 }
 
-/** ---------------- Binance (8h) ---------------- */
+/** ---------------- Binance (NEXT / forward-looking 8h) ----------------
+ * Use premiumIndex.lastFundingRate (next funding) instead of fundingRate history.
+ * premiumIndex: { markPrice, lastFundingRate, nextFundingTime, ... }
+ */
 async function getBinance() {
   const rows = [];
 
   for (const sym of TARGETS) {
     const fSym = BINANCE_SYMBOLS[sym];
 
-    // latest realized 8h funding rate
-    const fundingArr = await fetchJson(
-      `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${fSym}&limit=1`
-    );
-    const last =
-      Array.isArray(fundingArr) && fundingArr.length
-        ? fundingArr[fundingArr.length - 1]
-        : null;
-
-    const fundingRate8h = toNum(last?.fundingRate);
-    const fundingTimeIso = last?.fundingTime
-      ? new Date(Number(last.fundingTime)).toISOString()
-      : null;
-
-    // mark price
+    // ✅ single call: gives mark + next funding (lastFundingRate)
     const prem = await fetchJson(
       `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${fSym}`
     );
+
     const mark = toNum(prem?.markPrice);
+    const nextFundingRate8h = toNum(prem?.lastFundingRate); // "next" funding rate to be applied
+    const nextFundingTimeIso = prem?.nextFundingTime
+      ? new Date(Number(prem.nextFundingTime)).toISOString()
+      : null;
 
     rows.push({
       exchange: "binance",
       symbol: sym,
-      funding_rate_raw: fundingRate8h,
+      funding_rate_raw: nextFundingRate8h,
       funding_interval_s: 28800,
-      funding_rate_next_interval: fundingRate8h,
-      funding_rate_8h: fundingRate8h,
+      funding_rate_next_interval: nextFundingRate8h,
+      funding_rate_8h: nextFundingRate8h,
       mark_price: mark,
-      source_ts: fundingTimeIso,
+      source_ts: nextFundingTimeIso,
+      binance_source: "premiumIndex:lastFundingRate",
     });
   }
 
@@ -155,20 +129,16 @@ async function getBinance() {
 }
 
 /** ---------------- Lighter ----------------
- * Policy:
- * - 1-call /funding-rates
- * - strict symbol match (exact after normalization)
- * - last-candidate only
- *
- * NOTE:
- * - Lighter payload often does NOT include mark price; we fill it later from Binance.
+ * Keep it simple:
+ * - funding-rates 1 call
+ * - strict symbol match on raw_symbol
+ * - pick LAST candidate for each symbol
  */
 async function getLighter() {
   let data;
   try {
-    data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`, 8000);
+    data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`, 9000);
   } catch (e) {
-    // If 429 / timeout, return empty rows (do not break whole API)
     console.log("[lighter] funding-rates failed:", String(e?.message || e));
     return [];
   }
@@ -180,59 +150,49 @@ async function getLighter() {
     Array.isArray(data?.fundingRates) ? data.fundingRates :
     [];
 
-  // collect candidates per symbol (strict)
+  // candidates grouped by "strict symbol"
   const candsBySym = new Map();
   for (const it of items) {
-    const raw = pickField(it, ["symbol", "raw_symbol", "rawSymbol", "asset", "ticker", "base", "market"]);
-    const sym = normalizeSymbol(raw);
-    if (!TARGETS.includes(sym)) continue; // ✅ strict match only
+    const raw = String(pickField(it, ["raw_symbol", "rawSymbol", "symbol", "market", "ticker"]) || "").toUpperCase();
 
-    if (!candsBySym.has(sym)) candsBySym.set(sym, []);
-    candsBySym.get(sym).push(it);
+    // ✅ strict: must be exactly one of TARGETS
+    if (!TARGETS.includes(raw)) continue;
+
+    if (!candsBySym.has(raw)) candsBySym.set(raw, []);
+    candsBySym.get(raw).push(it);
   }
 
   const rows = [];
-
   for (const sym of TARGETS) {
     const cands = candsBySym.get(sym) || [];
     if (!cands.length) continue;
 
-    // ✅ last-candidate
+    // ✅ pick LAST candidate
     const picked = cands[cands.length - 1];
 
     const rateRaw = toNum(
-      pickField(picked, [
-        "funding_rate",
-        "fundingRate",
-        "rate",
-        "funding_rate_raw",
-        "fundingRateRaw",
-      ])
+      pickField(picked, ["funding_rate", "fundingRate", "rate", "funding_rate_raw"])
     );
+    const interval = toNum(
+      pickField(picked, ["funding_interval_s", "fundingIntervalS", "interval_s", "intervalS"])
+    ) ?? 28800;
 
-    const intervalS =
-      toNum(pickField(picked, ["funding_interval_s", "fundingIntervalS", "interval_s", "intervalS"])) ||
-      28800; // default assume 8h-equivalent if not present
-
+    // funding-rates 응답은 mark가 없을 때가 많아서 fillMissingMarks에서 보정
     const mark = toNum(pickField(picked, ["mark_price", "markPrice", "mark"]));
-    const ts =
-      pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt", "time"]) ?? null;
 
-    const marketId =
-      pickField(picked, ["market_id", "marketId", "market_index", "marketIndex", "market"]) ?? null;
+    // market id
+    const marketId = toNum(pickField(picked, ["market_id", "marketId", "market_index", "marketIndex"]));
 
     rows.push({
       exchange: "lighter",
       symbol: sym,
       funding_rate_raw: rateRaw,
-      funding_interval_s: 28800, // output normalized to 8h interval
-      funding_rate_next_interval: normalizeTo8h(rateRaw, intervalS),
-      funding_rate_8h: normalizeTo8h(rateRaw, intervalS),
-      mark_price: mark, // may be null -> filled later
-      source_ts: ts,
-      raw_symbol: normalizeSymbol(
-        pickField(picked, ["raw_symbol", "rawSymbol", "symbol", "asset", "ticker"])
-      ) || null,
+      funding_interval_s: interval,
+      funding_rate_next_interval: rateRaw,
+      funding_rate_8h: normalizeTo8h(rateRaw, interval),
+      mark_price: mark,
+      source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
+      raw_symbol: sym,
       lighter_market_id: marketId,
       lighter_source: "funding-rates:last-candidate",
       lighter_candidate_count: cands.length,
@@ -242,8 +202,8 @@ async function getLighter() {
   return rows;
 }
 
-/** mark fallback: Prefer binance marks, then variational */
 function fillMissingMarks(rows) {
+  // Prefer binance marks as fallback, then variational
   const markBySymbol = new Map();
 
   for (const r of rows) {
