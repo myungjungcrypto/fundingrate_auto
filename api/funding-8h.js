@@ -1,5 +1,11 @@
 // api/funding-8h.js
-// Aggregates funding/mark from Variational, Binance, Lighter and normalizes to 8h-equivalent.
+// Aggregates funding/mark from Variational, Binance, Lighter.
+// - Variational funding_rate is ANNUAL -> convert to 8h
+// - Binance fundingRate is 8h realized
+// - Lighter: prefer /fundings (hourly) -> sum last 8 hours as 8h-equivalent
+//           fallback to /funding-rates "last candidate" if /fundings fails
+// - Adds retry + partial errors so one exchange failure doesn't break the whole response
+// - Optional debug: add ?debug=1 to include lighter_debug in response
 
 const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
 
@@ -15,30 +21,16 @@ const VARIATIONAL_BASE =
 
 const LIGHTER_BASE = "https://mainnet.zklighter.elliot.ai";
 
-/** ---------- helpers ---------- */
+/** ---------------- helpers ---------------- */
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 function toNum(x) {
   if (x === null || x === undefined) return null;
   const n = Number(x);
   return Number.isFinite(n) ? n : null;
-}
-
-function annualTo8h(annualRate) {
-  const r = toNum(annualRate);
-  if (r === null) return null;
-  // 1 year ≈ 365 days, 3 funding windows/day => 1095 windows/year
-  return r / (365 * 3);
-}
-
-async function fetchJson(url, timeoutMs = 9000) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const resp = await fetch(url, { signal: controller.signal });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${url}`);
-    return await resp.json();
-  } finally {
-    clearTimeout(t);
-  }
 }
 
 function pickField(obj, keys) {
@@ -48,9 +40,68 @@ function pickField(obj, keys) {
   return null;
 }
 
-/** ---------- Variational ---------- */
+// Variational funding_rate is annual fraction (e.g. 0.1095 = 10.95% APR annual)
+// Convert to 8h window: 365 days * 3 windows/day = 1095 windows/year
+function annualTo8h(annualRate) {
+  const r = toNum(annualRate);
+  if (r === null) return null;
+  return r / (365 * 3);
+}
+
+async function fetchJson(url, timeoutMs = 10000, retries = 2) {
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const resp = await fetch(url, { signal: controller.signal });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status} ${url}`);
+      return await resp.json();
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries) {
+        await sleep(250 * (attempt + 1));
+      }
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  throw lastErr;
+}
+
+function extractArrayCandidates(data) {
+  const arr =
+    Array.isArray(data) ? data :
+    Array.isArray(data?.data) ? data.data :
+    Array.isArray(data?.funding_rates) ? data.funding_rates :
+    Array.isArray(data?.fundingRates) ? data.fundingRates :
+    Array.isArray(data?.data?.funding_rates) ? data.data.funding_rates :
+    Array.isArray(data?.data?.fundingRates) ? data.data.fundingRates :
+    null;
+
+  if (arr) return arr;
+
+  // Sometimes APIs return a map/object → use Object.values
+  if (data && typeof data === "object") {
+    const vals = Object.values(data);
+    if (vals.every((v) => v && typeof v === "object")) return vals;
+
+    if (data.data && typeof data.data === "object") {
+      const vals2 = Object.values(data.data);
+      if (vals2.every((v) => v && typeof v === "object")) return vals2;
+    }
+  }
+  return [];
+}
+
+/** ---------------- Variational ----------------
+ * stats.listings[]: ticker, funding_rate(ANNUAL), funding_interval_s, mark_price, quotes.updated_at
+ */
 async function getVariational() {
-  const stats = await fetchJson(`${VARIATIONAL_BASE}/metadata/stats`);
+  const stats = await fetchJson(`${VARIATIONAL_BASE}/metadata/stats`, 12000, 2);
   const listings = Array.isArray(stats?.listings) ? stats.listings : [];
 
   const byTicker = new Map();
@@ -81,16 +132,17 @@ async function getVariational() {
   return rows;
 }
 
-/** ---------- Binance (8h) ---------- */
+/** ---------------- Binance (8h realized) ---------------- */
 async function getBinance() {
   const rows = [];
 
   for (const sym of TARGETS) {
     const fSym = BINANCE_SYMBOLS[sym];
 
-    // latest realized 8h funding rate
     const fundingArr = await fetchJson(
-      `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${fSym}&limit=1`
+      `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${fSym}&limit=1`,
+      12000,
+      2
     );
     const last =
       Array.isArray(fundingArr) && fundingArr.length
@@ -102,9 +154,10 @@ async function getBinance() {
       ? new Date(Number(last.fundingTime)).toISOString()
       : null;
 
-    // mark price
     const prem = await fetchJson(
-      `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${fSym}`
+      `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${fSym}`,
+      12000,
+      2
     );
     const mark = toNum(prem?.markPrice);
 
@@ -123,20 +176,14 @@ async function getBinance() {
   return rows;
 }
 
-/** ---------- Lighter helpers ---------- */
-function lighterGetSymbol_(it) {
+/** ---------------- Lighter ---------------- */
+
+function lighterExtractSymbol_(it) {
   const raw = pickField(it, ["symbol", "ticker", "market", "marketSymbol", "name"]);
   return String(raw || "").toUpperCase();
 }
 
-function lighterGetMarketIndex_(it) {
-  // orderBookDetails 쪽은 market_index가 자주 보임
-  const v = pickField(it, ["market_index", "marketIndex", "marketId", "orderBook", "order_book"]);
-  const n = toNum(v);
-  return n === null ? null : n;
-}
-
-function lighterGetRateRaw_(it) {
+function lighterExtractRate_(it) {
   const v = pickField(it, [
     "rate",
     "funding_rate",
@@ -147,63 +194,6 @@ function lighterGetRateRaw_(it) {
   return toNum(v);
 }
 
-function normalizeLighterTo8hBySumming8Hourly_(hourlyRates) {
-  // 8시간 동등값 = 최근 8번(8시간) hourly funding rate 합
-  const xs = (hourlyRates || []).map(toNum).filter((x) => x !== null);
-  if (!xs.length) return null;
-  return xs.reduce((a, b) => a + b, 0);
-}
-
-async function lighterFetchLast8HourlyFundings_(marketIndex) {
-  // fundings endpoint param 스펙이 환경마다 다를 수 있어서 여러 URL을 순차 시도
-  const limit = 8;
-  const urls = [
-    `${LIGHTER_BASE}/api/v1/fundings?market_index=${marketIndex}&resolution=1h&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?marketIndex=${marketIndex}&resolution=1h&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?market_id=${marketIndex}&resolution=1h&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?marketId=${marketIndex}&resolution=1h&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?order_book=${marketIndex}&resolution=1h&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?orderBook=${marketIndex}&resolution=1h&limit=${limit}`,
-    // resolution 파라미터가 없을 수도 있어서 fallback
-    `${LIGHTER_BASE}/api/v1/fundings?market_index=${marketIndex}&limit=${limit}`,
-    `${LIGHTER_BASE}/api/v1/fundings?marketIndex=${marketIndex}&limit=${limit}`,
-  ];
-
-  let lastErr = null;
-  for (const url of urls) {
-    try {
-      const data = await fetchJson(url);
-      const items =
-        Array.isArray(data) ? data :
-        Array.isArray(data?.data) ? data.data :
-        Array.isArray(data?.fundings) ? data.fundings :
-        Array.isArray(data?.rows) ? data.rows :
-        [];
-
-      // funding rate 필드명도 케이스가 여러가지일 수 있어서 후보로 뽑기
-      const rates = items
-        .map((x) => toNum(pickField(x, ["funding_rate", "fundingRate", "rate"])))
-        .filter((x) => x !== null);
-
-      if (rates.length) {
-        // 보통 최신이 뒤에 붙는 형태가 많아서 마지막 8개로 맞춤
-        const last8 = rates.slice(-limit);
-        return { rates: last8, source: url };
-      }
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-
-  throw new Error(
-    `Lighter fundings fetch failed for marketIndex=${marketIndex}. lastErr=${String(
-      lastErr?.message ?? lastErr
-    )}`
-  );
-}
-
-/** ---------- Lighter (hourly -> 8h equivalent) ---------- */
-
 function lighterExtractMarketId_(it) {
   const v = pickField(it, ["marketId", "market_id", "marketIndex", "market_index", "id"]);
   const n = toNum(v);
@@ -213,13 +203,14 @@ function lighterExtractMarketId_(it) {
 async function lighterFetchLast8HourlyFundingsByMarketId_(marketId) {
   const limit = 8;
 
-  // fundings endpoint 스펙이 애매해서 여러 케이스를 순차 시도
+  // Try multiple param spellings for robustness
   const urls = [
     `${LIGHTER_BASE}/api/v1/fundings?marketId=${marketId}&resolution=1h&limit=${limit}`,
     `${LIGHTER_BASE}/api/v1/fundings?market_id=${marketId}&resolution=1h&limit=${limit}`,
     `${LIGHTER_BASE}/api/v1/fundings?marketIndex=${marketId}&resolution=1h&limit=${limit}`,
     `${LIGHTER_BASE}/api/v1/fundings?market_index=${marketId}&resolution=1h&limit=${limit}`,
-    // resolution 없이도 시도
+
+    // without resolution
     `${LIGHTER_BASE}/api/v1/fundings?marketId=${marketId}&limit=${limit}`,
     `${LIGHTER_BASE}/api/v1/fundings?market_id=${marketId}&limit=${limit}`,
     `${LIGHTER_BASE}/api/v1/fundings?marketIndex=${marketId}&limit=${limit}`,
@@ -230,8 +221,7 @@ async function lighterFetchLast8HourlyFundingsByMarketId_(marketId) {
 
   for (const url of urls) {
     try {
-      const data = await fetchJson(url);
-
+      const data = await fetchJson(url, 12000, 1);
       const items =
         Array.isArray(data) ? data :
         Array.isArray(data?.data) ? data.data :
@@ -244,8 +234,9 @@ async function lighterFetchLast8HourlyFundingsByMarketId_(marketId) {
         .filter((x) => x !== null);
 
       if (rates.length) {
-        const last8 = rates.slice(-limit);
-        return { rates: last8, source: url };
+        // keep last N in case the API returns more
+        const lastN = rates.slice(-limit);
+        return { rates: lastN, source: url };
       }
     } catch (e) {
       lastErr = e;
@@ -259,53 +250,72 @@ async function lighterFetchLast8HourlyFundingsByMarketId_(marketId) {
   );
 }
 
-async function getLighter() {
-  // 1) funding-rates에서 후보들을 가져온다 (여기서 심볼+marketId를 확보)
-  const data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`);
+async function getLighter(debugOn = false) {
+  // Cache-bust to avoid edge caching weirdness
+  const data = await fetchJson(
+    `${LIGHTER_BASE}/api/v1/funding-rates?t=${Date.now()}`,
+    12000,
+    2
+  );
 
-  const items =
-    Array.isArray(data) ? data :
-    Array.isArray(data?.data) ? data.data :
-    Array.isArray(data?.funding_rates) ? data.funding_rates :
-    Array.isArray(data?.fundingRates) ? data.fundingRates :
-    [];
+  const items = extractArrayCandidates(data);
 
-  // symbol별 후보 모으기 (배열 순서 유지)
+  // Group candidates by exact symbol (avoid ETHFI / RESOLV contamination)
   const candsBySym = new Map();
   for (const it of items) {
-    const raw = lighterGetSymbol_(it);
-    // 정확 심볼만 통과 (ETHFI/RESOLV 같은 오염 제거)
-    if (!TARGETS.includes(raw)) continue;
+    const symRaw = lighterExtractSymbol_(it);
+    if (!TARGETS.includes(symRaw)) continue;
 
-    if (!candsBySym.has(raw)) candsBySym.set(raw, []);
-    candsBySym.get(raw).push(it);
+    if (!candsBySym.has(symRaw)) candsBySym.set(symRaw, []);
+    candsBySym.get(symRaw).push(it);
   }
 
   const rows = [];
+  const lighter_debug = {};
 
   for (const sym of TARGETS) {
     const cands = candsBySym.get(sym) || [];
     if (!cands.length) continue;
 
-    // ✅ last candidate 룰
-    const picked = cands[cands.length - 1];
+    const pickedIdx = cands.length - 1;
+    const picked = cands[pickedIdx];
 
-    const marketId = lighterExtractMarketId_(picked) ?? lighterExtractMarketId_(cands[0]);
-    const lastRate = lighterGetRateRaw_(picked);
+    const marketId =
+      lighterExtractMarketId_(picked) ??
+      lighterExtractMarketId_(cands[0]) ??
+      null;
 
-    // 2) 가능하면 fundings(시간별)로 최근 8개 합산 → 8h 동등값
-    try {
-      if (marketId !== null) {
+    const lastCandidateRate = lighterExtractRate_(picked);
+
+    // Debug snapshot
+    if (debugOn) {
+      lighter_debug[sym] = {
+        candidateCount: cands.length,
+        pickedIndex: pickedIdx,
+        candidates: cands.map((x, i) => {
+          const rawSymbol = lighterExtractSymbol_(x);
+          const rate = lighterExtractRate_(x);
+          const mi = lighterExtractMarketId_(x);
+          const mk = toNum(pickField(x, ["mark_price", "markPrice", "mark"]));
+          const ts = pickField(x, ["timestamp", "ts", "updated_at", "updatedAt"]);
+          return { i, rawSymbol, marketId: mi, rate, mark: mk ?? null, ts: ts ?? null };
+        }),
+      };
+    }
+
+    // Try /fundings to compute 8h-equivalent via sum(last 8 hourly)
+    if (marketId !== null) {
+      try {
         const { rates, source } = await lighterFetchLast8HourlyFundingsByMarketId_(marketId);
-        const rate8hEquiv = rates.reduce((a, b) => a + b, 0);
+        const sum8h = rates.reduce((a, b) => a + b, 0);
 
         rows.push({
           exchange: "lighter",
           symbol: sym,
-          funding_rate_raw: lastRate,        // funding-rates에서 본 "최근값"
-          funding_interval_s: 28800,         // 출력 통일용(8h)
-          funding_rate_next_interval: lastRate,
-          funding_rate_8h: rate8hEquiv,      // ✅ 8h 동등값(최근 8개 hourly 합)
+          funding_rate_raw: lastCandidateRate, // last-candidate (matches UI more often)
+          funding_interval_s: 28800, // normalize output to 8h
+          funding_rate_next_interval: lastCandidateRate,
+          funding_rate_8h: sum8h, // ✅ 8h equivalent from hourly history
           mark_price: null,
           source_ts: null,
           raw_symbol: sym,
@@ -315,33 +325,35 @@ async function getLighter() {
         });
 
         continue;
+      } catch (e) {
+        console.log(
+          `[lighter] fundings failed -> fallback to funding-rates:last-candidate (${sym}, marketId=${marketId}):`,
+          String(e?.message || e)
+        );
       }
-    } catch (e) {
-      console.log(`[lighter] fundings failed, fallback to last candidate (${sym}):`, String(e?.message || e));
     }
 
-    // 3) fundings 실패 시 fallback: funding-rates의 last candidate 값(너가 확인한 “정확한 값”)
+    // Fallback: last candidate from funding-rates
     rows.push({
       exchange: "lighter",
       symbol: sym,
-      funding_rate_raw: lastRate,
+      funding_rate_raw: lastCandidateRate,
       funding_interval_s: 28800,
-      funding_rate_next_interval: lastRate,
-      funding_rate_8h: lastRate,
+      funding_rate_next_interval: lastCandidateRate,
+      funding_rate_8h: lastCandidateRate,
       mark_price: null,
       source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
-      raw_symbol: lighterGetSymbol_(picked) || sym,
+      raw_symbol: lighterExtractSymbol_(picked) || sym,
       lighter_market_id: marketId,
       lighter_source: "funding-rates:last-candidate",
       lighter_candidate_count: cands.length,
     });
   }
 
-  return rows;
+  return debugOn ? { rows, lighter_debug } : { rows };
 }
 
-
-/** ---------- marks fallback ---------- */
+/** ---------------- marks fallback ---------------- */
 function fillMissingMarks(rows) {
   // Prefer binance marks as fallback, then variational
   const markBySymbol = new Map();
@@ -363,25 +375,51 @@ function fillMissingMarks(rows) {
   }
 }
 
-/** ---------- handler ---------- */
+/** ---------------- handler ---------------- */
 export default async function handler(req, res) {
-  try {
-    const asOf = new Date().toISOString();
+  const asOf = new Date().toISOString();
+  const debugOn = String(req.query?.debug || "") === "1";
 
-    const [v, b, l] = await Promise.all([
-      getVariational(),
-      getBinance(),
-      getLighter(),
-    ]);
+  const errors = [];
 
-    const rows = [...v, ...b, ...l];
-    fillMissingMarks(rows);
+  const settled = await Promise.allSettled([
+    getVariational(),
+    getBinance(),
+    getLighter(debugOn),
+  ]);
 
-    res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=60");
-    res.setHeader("Access-Control-Allow-Origin", "*");
+  const [vRes, bRes, lRes] = settled;
 
-    res.status(200).json({ asOf, rows });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message ?? e) });
+  const v =
+    vRes.status === "fulfilled"
+      ? vRes.value
+      : (errors.push({ exchange: "variational", error: String(vRes.reason) }), []);
+
+  const b =
+    bRes.status === "fulfilled"
+      ? bRes.value
+      : (errors.push({ exchange: "binance", error: String(bRes.reason) }), []);
+
+  let lRows = [];
+  let lighter_debug = undefined;
+
+  if (lRes.status === "fulfilled") {
+    lRows = Array.isArray(lRes.value?.rows) ? lRes.value.rows : [];
+    if (debugOn && lRes.value?.lighter_debug) lighter_debug = lRes.value.lighter_debug;
+  } else {
+    errors.push({ exchange: "lighter", error: String(lRes.reason) });
   }
+
+  const rows = [...v, ...b, ...lRows];
+  fillMissingMarks(rows);
+
+  // Apps Script 대비 캐시 + CORS
+  res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=60");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  const payload = { asOf, rows };
+  if (errors.length) payload.errors = errors;
+  if (debugOn && lighter_debug) payload.lighter_debug = lighter_debug;
+
+  res.status(200).json(payload);
 }
