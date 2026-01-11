@@ -1,5 +1,5 @@
 // api/funding-8h.js
-// Aggregates funding/mark from Variational, Binance, Lighter and normalizes to 8h.
+// Aggregates funding/mark from Variational, Binance, Lighter and normalizes to 8h-equivalent.
 
 const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
 
@@ -15,6 +15,7 @@ const VARIATIONAL_BASE =
 
 const LIGHTER_BASE = "https://mainnet.zklighter.elliot.ai";
 
+/** ---------- helpers ---------- */
 function toNum(x) {
   if (x === null || x === undefined) return null;
   const n = Number(x);
@@ -28,15 +29,7 @@ function annualTo8h(annualRate) {
   return r / (365 * 3);
 }
 
-// interval_s 기반 8h 환산 (필요 시만)
-function normalizeTo8h(rate, interval_s) {
-  const r = toNum(rate);
-  const s = toNum(interval_s);
-  if (r === null || s === null || s <= 0) return null;
-  return r * (28800 / s);
-}
-
-async function fetchJson(url, timeoutMs = 8000) {
+async function fetchJson(url, timeoutMs = 9000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -55,9 +48,7 @@ function pickField(obj, keys) {
   return null;
 }
 
-/** ---------------- Variational ----------------
- * stats.listings[]: ticker, funding_rate(ANNUAL), funding_interval_s, mark_price, quotes.updated_at
- */
+/** ---------- Variational ---------- */
 async function getVariational() {
   const stats = await fetchJson(`${VARIATIONAL_BASE}/metadata/stats`);
   const listings = Array.isArray(stats?.listings) ? stats.listings : [];
@@ -80,7 +71,7 @@ async function getVariational() {
       exchange: "variational",
       symbol: sym,
       funding_rate_raw: rateAnnual, // annual
-      funding_interval_s: 28800, // normalize output to 8h
+      funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
       mark_price: toNum(it.mark_price),
@@ -90,7 +81,7 @@ async function getVariational() {
   return rows;
 }
 
-/** ---------------- Binance (8h) ---------------- */
+/** ---------- Binance (8h) ---------- */
 async function getBinance() {
   const rows = [];
 
@@ -132,119 +123,183 @@ async function getBinance() {
   return rows;
 }
 
-/** ---------------- Lighter ----------------
- * NOTE:
- * - Your observation: the LAST entry per symbol is the correct one.
- * - So we group by symbol and keep only the last candidate.
- * - We treat Lighter returned rate as already 8h-equivalent (interval_s=28800).
- */
-function lighterExtractSymbol_(it) {
-  const raw = String(
-    pickField(it, ["symbol", "ticker", "market", "marketSymbol", "name", "base"]) || ""
-  ).toUpperCase();
-
-  // exact match only: BTC/ETH/SOL/BNB
-  if (TARGETS.includes(raw)) return raw;
-
-  // some APIs may use "BTC-PERP" or "BTC_PERP" etc.
-  for (const s of TARGETS) {
-    if (raw === s) return s;
-    if (raw.startsWith(s + "-") || raw.startsWith(s + "_") || raw === s + "PERP" || raw.includes(`${s}-PERP`) || raw.includes(`${s}_PERP`)) {
-      return s;
-    }
-  }
-
-  return null;
+/** ---------- Lighter helpers ---------- */
+function lighterGetSymbol_(it) {
+  const raw = pickField(it, ["symbol", "ticker", "market", "marketSymbol", "name"]);
+  return String(raw || "").toUpperCase();
 }
 
-function lighterExtractRate_(it) {
-  // candidates (we will treat the extracted number as 8h funding)
-  const keys = [
-    "funding_rate_8h",
-    "fundingRate8h",
+function lighterGetMarketIndex_(it) {
+  // orderBookDetails 쪽은 market_index가 자주 보임
+  const v = pickField(it, ["market_index", "marketIndex", "marketId", "orderBook", "order_book"]);
+  const n = toNum(v);
+  return n === null ? null : n;
+}
+
+function lighterGetRateRaw_(it) {
+  const v = pickField(it, [
+    "rate",
     "funding_rate",
     "fundingRate",
-    "rate",
-    "nextFundingRate",
-    "next_funding_rate",
     "hourly_funding_rate",
     "hourlyFundingRate",
-  ];
-
-  for (const k of keys) {
-    const v = pickField(it, [k]);
-    if (v !== null && v !== undefined) {
-      const n = toNum(v);
-      if (n !== null) return n;
-    }
-  }
-  return null;
+  ]);
+  return toNum(v);
 }
 
-async function getLighter() {
-  const data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`);
+function normalizeLighterTo8hBySumming8Hourly_(hourlyRates) {
+  // 8시간 동등값 = 최근 8번(8시간) hourly funding rate 합
+  const xs = (hourlyRates || []).map(toNum).filter((x) => x !== null);
+  if (!xs.length) return null;
+  return xs.reduce((a, b) => a + b, 0);
+}
 
-  const items =
-    Array.isArray(data) ? data :
-    Array.isArray(data?.data) ? data.data :
-    Array.isArray(data?.funding_rates) ? data.funding_rates :
-    Array.isArray(data?.fundingRates) ? data.fundingRates :
-    [];
+async function lighterFetchLast8HourlyFundings_(marketIndex) {
+  // fundings endpoint param 스펙이 환경마다 다를 수 있어서 여러 URL을 순차 시도
+  const limit = 8;
+  const urls = [
+    `${LIGHTER_BASE}/api/v1/fundings?market_index=${marketIndex}&resolution=1h&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?marketIndex=${marketIndex}&resolution=1h&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?market_id=${marketIndex}&resolution=1h&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?marketId=${marketIndex}&resolution=1h&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?order_book=${marketIndex}&resolution=1h&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?orderBook=${marketIndex}&resolution=1h&limit=${limit}`,
+    // resolution 파라미터가 없을 수도 있어서 fallback
+    `${LIGHTER_BASE}/api/v1/fundings?market_index=${marketIndex}&limit=${limit}`,
+    `${LIGHTER_BASE}/api/v1/fundings?marketIndex=${marketIndex}&limit=${limit}`,
+  ];
 
-  // candidates per symbol (in array order)
-  const candsBySym = new Map();
-  for (const it of items) {
-    const sym = lighterExtractSymbol_(it);
-    if (!sym) continue;
-    if (!candsBySym.has(sym)) candsBySym.set(sym, []);
-    candsBySym.get(sym).push(it);
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const data = await fetchJson(url);
+      const items =
+        Array.isArray(data) ? data :
+        Array.isArray(data?.data) ? data.data :
+        Array.isArray(data?.fundings) ? data.fundings :
+        Array.isArray(data?.rows) ? data.rows :
+        [];
+
+      // funding rate 필드명도 케이스가 여러가지일 수 있어서 후보로 뽑기
+      const rates = items
+        .map((x) => toNum(pickField(x, ["funding_rate", "fundingRate", "rate"])))
+        .filter((x) => x !== null);
+
+      if (rates.length) {
+        // 보통 최신이 뒤에 붙는 형태가 많아서 마지막 8개로 맞춤
+        const last8 = rates.slice(-limit);
+        return { rates: last8, source: url };
+      }
+    } catch (e) {
+      lastErr = e;
+    }
   }
 
-  // keep LAST per symbol
-  const rows = [];
-  const debug = {};
+  throw new Error(
+    `Lighter fundings fetch failed for marketIndex=${marketIndex}. lastErr=${String(
+      lastErr?.message ?? lastErr
+    )}`
+  );
+}
 
+/** ---------- Lighter (hourly -> 8h equivalent) ---------- */
+async function getLighter() {
+  // 1) perp 마켓 목록에서 심볼별 market_index 확보
+  const perpIndexBySym = new Map();
+  try {
+    const ob = await fetchJson(`${LIGHTER_BASE}/api/v1/orderBookDetails?type=perp`);
+    const obItems =
+      Array.isArray(ob) ? ob :
+      Array.isArray(ob?.data) ? ob.data :
+      Array.isArray(ob?.order_books) ? ob.order_books :
+      Array.isArray(ob?.orderBooks) ? ob.orderBooks :
+      [];
+
+    for (const it of obItems) {
+      const symRaw = lighterGetSymbol_(it);
+      const sym = TARGETS.find((s) => symRaw === s || symRaw.includes(s));
+      if (!sym) continue;
+
+      const idx = lighterGetMarketIndex_(it);
+      if (idx === null) continue;
+
+      // 심볼당 1개만 (라이터는 실질적으로 마켓 1개라는 전제)
+      if (!perpIndexBySym.has(sym)) perpIndexBySym.set(sym, idx);
+    }
+  } catch (e) {
+    console.log("[lighter] orderBookDetails failed:", String(e?.message || e));
+  }
+
+  const rows = [];
+
+  // 2) 심볼별로 "최근 8시간 hourly funding 합"을 8h 동등값으로 사용
   for (const sym of TARGETS) {
-    const cands = candsBySym.get(sym) || [];
+    const marketIndex = perpIndexBySym.get(sym);
+    if (marketIndex === undefined) continue;
+
+    // 2-a) fundings로 last 8 hourly rate를 받아서 합
+    try {
+      const { rates, source } = await lighterFetchLast8HourlyFundings_(marketIndex);
+      const lastHourly = rates.length ? rates[rates.length - 1] : null;
+      const rate8hEquiv = normalizeLighterTo8hBySumming8Hourly_(rates);
+
+      rows.push({
+        exchange: "lighter",
+        symbol: sym,
+        funding_rate_raw: lastHourly,          // 마지막(가장 최근) hourly rate
+        funding_interval_s: 3600,              // source는 hourly
+        funding_rate_next_interval: lastHourly,
+        funding_rate_8h: rate8hEquiv,          // ✅ 8h 동등값(최근 8개 합)
+        mark_price: null,                      // 아래 fillMissingMarks에서 채움
+        source_ts: null,
+        raw_symbol: sym,
+        lighter_market_index: marketIndex,
+        lighter_source: source,
+      });
+      continue;
+    } catch (e) {
+      console.log(`[lighter] fundings fallback to funding-rates for ${sym}:`, String(e?.message || e));
+    }
+
+    // 2-b) fundings 실패 시: 기존 funding-rates 후보 중 "마지막 1개"를 사용 (fallback)
+    const data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`);
+    const items =
+      Array.isArray(data) ? data :
+      Array.isArray(data?.data) ? data.data :
+      Array.isArray(data?.funding_rates) ? data.funding_rates :
+      Array.isArray(data?.fundingRates) ? data.fundingRates :
+      [];
+
+    const cands = items.filter((it) => {
+      const raw = lighterGetSymbol_(it);
+      const s = TARGETS.find((x) => raw === x || raw.includes(x));
+      return s === sym;
+    });
+
     if (!cands.length) continue;
 
-    const pickedIdx = cands.length - 1;
-    const picked = cands[pickedIdx];
-
-    const rate8h = lighterExtractRate_(picked);
-    const mark = toNum(pickField(picked, ["mark_price", "markPrice", "mark"]));
+    const picked = cands[cands.length - 1];
+    const rateRaw = lighterGetRateRaw_(picked);
 
     rows.push({
       exchange: "lighter",
       symbol: sym,
-      funding_rate_raw: rate8h,
-      funding_interval_s: 28800,
-      funding_rate_next_interval: rate8h,
-      funding_rate_8h: rate8h,
-      mark_price: mark,
+      funding_rate_raw: rateRaw,
+      funding_interval_s: 28800,              // fallback에서는 8h 취급
+      funding_rate_next_interval: rateRaw,
+      funding_rate_8h: rateRaw,
+      mark_price: null,
       source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
-      raw_symbol: String(pickField(picked, ["symbol", "ticker", "market", "marketSymbol", "name"]) || sym),
+      raw_symbol: lighterGetSymbol_(picked) || null,
+      lighter_market_index: lighterGetMarketIndex_(picked),
+      lighter_source: "funding-rates:fallback-last",
     });
-
-    // ---- debug snapshot (trim to important fields only) ----
-    debug[sym] = {
-      candidateCount: cands.length,
-      pickedIndex: pickedIdx,
-      candidates: cands.map((x, i) => {
-        const rawSymbol = String(pickField(x, ["symbol","ticker","market","marketSymbol","name"]) || "");
-        const rate = lighterExtractRate_(x);
-        const mi = pickField(x, ["market_index","marketIndex","market_id","marketId","id"]);
-        const mk = toNum(pickField(x, ["mark_price","markPrice","mark"]));
-        const ts = pickField(x, ["timestamp","ts","updated_at","updatedAt"]);
-        return { i, rawSymbol, marketId: mi ?? null, rate, mark: mk ?? null, ts: ts ?? null };
-      }),
-    };
   }
 
-  return { rows, debug };
+  return rows;
 }
 
-
+/** ---------- marks fallback ---------- */
 function fillMissingMarks(rows) {
   // Prefer binance marks as fallback, then variational
   const markBySymbol = new Map();
@@ -266,28 +321,24 @@ function fillMissingMarks(rows) {
   }
 }
 
+/** ---------- handler ---------- */
 export default async function handler(req, res) {
   try {
     const asOf = new Date().toISOString();
-    const debugOn = String(req.query?.debug || "") === "1";
 
-    const [v, b, lighter] = await Promise.all([
+    const [v, b, l] = await Promise.all([
       getVariational(),
       getBinance(),
-      getLighter(), // now returns { rows, debug }
+      getLighter(),
     ]);
 
-    const l = lighter.rows;
     const rows = [...v, ...b, ...l];
     fillMissingMarks(rows);
 
     res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=60");
     res.setHeader("Access-Control-Allow-Origin", "*");
 
-    const payload = { asOf, rows };
-    if (debugOn) payload.lighter_debug = lighter.debug;
-
-    res.status(200).json(payload);
+    res.status(200).json({ asOf, rows });
   } catch (e) {
     res.status(500).json({ error: String(e?.message ?? e) });
   }
