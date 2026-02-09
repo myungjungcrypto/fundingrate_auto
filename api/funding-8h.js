@@ -202,9 +202,11 @@ async function getLighter() {
 
 /** ---------------- Hyperliquid ----------------
  * POST /info { type: "metaAndAssetCtxs" }
- * Commonly: response = [meta, assetCtxs]
- * ctx: { coin, funding, markPx, ... }
- * funding is typically per 1h -> normalize to 8h
+ *
+ * IMPORTANT:
+ *  - Response shape is typically: [ { universe: [{name:"BTC"}, ...] }, assetCtxsArray ]
+ *  - assetCtxsArray items DO NOT necessarily include coin/name; they are aligned by universe index.
+ *  - funding is typically per 1h -> normalize to 8h
  */
 async function getHyperliquid() {
   let j;
@@ -223,30 +225,43 @@ async function getHyperliquid() {
     return [];
   }
 
-  // robust extract assetCtxs
+  // Extract universe + assetCtxs robustly
+  let universe = null;
   let assetCtxs = null;
 
-  // A) [meta, assetCtxs]
-  if (Array.isArray(j) && Array.isArray(j[1])) assetCtxs = j[1];
+  // A) [ {universe:[...]}, [ ...ctxs ] ]
+  if (Array.isArray(j) && j.length >= 2) {
+    if (Array.isArray(j?.[0]?.universe)) universe = j[0].universe;
+    if (Array.isArray(j?.[1])) assetCtxs = j[1];
+  }
 
-  // B) { assetCtxs: [...] }
+  // B) { universe:[...], assetCtxs:[...] }
+  if (!universe && Array.isArray(j?.universe)) universe = j.universe;
   if (!assetCtxs && Array.isArray(j?.assetCtxs)) assetCtxs = j.assetCtxs;
 
-  // C) { result:{assetCtxs:[...] } } / { data:{assetCtxs:[...] } }
+  // C) { result:{universe:[...], assetCtxs:[...]} } / { data:{...} }
+  if (!universe && Array.isArray(j?.result?.universe)) universe = j.result.universe;
   if (!assetCtxs && Array.isArray(j?.result?.assetCtxs)) assetCtxs = j.result.assetCtxs;
+  if (!universe && Array.isArray(j?.data?.universe)) universe = j.data.universe;
   if (!assetCtxs && Array.isArray(j?.data?.assetCtxs)) assetCtxs = j.data.assetCtxs;
 
-  if (!Array.isArray(assetCtxs) || assetCtxs.length === 0) return [];
+  if (!Array.isArray(universe) || !Array.isArray(assetCtxs) || universe.length === 0 || assetCtxs.length === 0) {
+    console.log("[hyperliquid] unexpected shape:", JSON.stringify(j).slice(0, 300));
+    return [];
+  }
 
-  const byCoin = new Map();
-  for (const ctx of assetCtxs) {
-    const coin = String(ctx?.coin || ctx?.symbol || "").toUpperCase();
-    if (coin) byCoin.set(coin, ctx);
+  // Build name -> ctx using universe index alignment
+  const byName = new Map();
+  const n = Math.min(universe.length, assetCtxs.length);
+  for (let i = 0; i < n; i++) {
+    const name = String(universe[i]?.name || universe[i]?.coin || "").toUpperCase();
+    if (!name) continue;
+    byName.set(name, assetCtxs[i]);
   }
 
   const rows = [];
   for (const sym of TARGETS) {
-    const ctx = byCoin.get(sym);
+    const ctx = byName.get(sym);
     if (!ctx) continue;
 
     const rate1h =
@@ -272,7 +287,7 @@ async function getHyperliquid() {
       funding_rate_8h: rate8h,
       mark_price: mark,
       source_ts: null,
-      hyperliquid_source: "info:metaAndAssetCtxs (funding~1h)",
+      hyperliquid_source: "info:metaAndAssetCtxs (index-aligned universe)",
     });
   }
 
