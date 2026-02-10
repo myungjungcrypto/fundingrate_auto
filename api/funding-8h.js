@@ -386,12 +386,19 @@ async function getNado() {
   }
 
   // Docs show /query often returns object; try multiple shapes
-  const symbols =
-    Array.isArray(symResp) ? symResp :
-    Array.isArray(symResp?.symbols) ? symResp.symbols :
-    Array.isArray(symResp?.result?.symbols) ? symResp.result.symbols :
-    Array.isArray(symResp?.data?.symbols) ? symResp.data.symbols :
-    [];
+// nado: { status:"success", data:{ symbols:{ "SOL-PERP": {...}, ... } } }
+let symbolsObj =
+  (symResp && typeof symResp === "object" && symResp?.data?.symbols) ? symResp.data.symbols :
+  (symResp && typeof symResp === "object" && symResp?.result?.symbols) ? symResp.result.symbols :
+  (symResp && typeof symResp === "object" && symResp?.symbols) ? symResp.symbols :
+  null;
+
+const symbols = Array.isArray(symbolsObj)
+  ? symbolsObj
+  : (symbolsObj && typeof symbolsObj === "object")
+    ? Object.values(symbolsObj)
+    : [];
+
 
   if (!Array.isArray(symbols) || !symbols.length) {
     console.log("[nado] symbols empty, shape:", JSON.stringify(symResp).slice(0, 300));
@@ -401,15 +408,18 @@ async function getNado() {
   // Find perp product_id for targets
   const productBySym = new Map(); // sym -> product_id
   for (const s of symbols) {
-    const raw = String(s?.symbol || s?.name || "").toUpperCase();
+    const raw = String(s?.symbol || s?.name || "").toUpperCase(); // e.g. "SOL-PERP"
     const productId = toNum(s?.product_id ?? s?.productId ?? s?.id);
-    if (productId == null) continue;
-
+    if (!raw || productId == null) continue;
+  
+    // exact match: "BTC-PERP" style
     for (const sym of TARGETS) {
-      if (productBySym.has(sym)) continue;
-      if (raw.includes(sym) && raw.includes("PERP")) productBySym.set(sym, productId);
+      if (raw === `${sym}-PERP`) {
+        productBySym.set(sym, productId);
+      }
     }
   }
+  
 
   const productIds = Array.from(productBySym.values());
   if (!productIds.length) {
