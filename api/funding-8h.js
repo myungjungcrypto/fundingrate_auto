@@ -1,6 +1,9 @@
 // api/funding-8h.js
 // Aggregates funding/mark from Variational, Binance, Lighter, Hyperliquid (+ optional plugins)
 // and normalizes everything to 8h.
+// Response shape (Apps Script friendly):
+//   { asOf: ISOString, rows: [...] }
+// Optional: add ?debug=1 to include { errors: [...] } in response.
 
 const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
 
@@ -16,9 +19,10 @@ const VARIATIONAL_BASE =
 
 const LIGHTER_BASE = "https://mainnet.zklighter.elliot.ai";
 
-// Hyperliquid info endpoint (meta + contexts)
+// Hyperliquid info endpoint
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
+// --- helpers ---
 function toNum(x) {
   if (x === null || x === undefined) return null;
   const n = Number(x);
@@ -60,11 +64,24 @@ async function fetchJson(url, timeoutMs = 8000, options = {}) {
   }
 }
 
-/** ---------------- Variational ----------------
- * stats.listings[]: ticker, funding_rate(ANNUAL), funding_interval_s, mark_price, quotes.updated_at
- */
+async function fetchJsonWithRetry(url, timeoutMs, options, tries = 3, baseDelayMs = 250) {
+  let lastErr = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fetchJson(url, timeoutMs, options);
+    } catch (e) {
+      lastErr = e;
+      // simple backoff
+      const wait = baseDelayMs * Math.pow(2, i);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw lastErr;
+}
+
+/** ---------------- Variational ---------------- */
 async function getVariational() {
-  const stats = await fetchJson(`${VARIATIONAL_BASE}/metadata/stats`);
+  const stats = await fetchJson(`${VARIATIONAL_BASE}/metadata/stats`, 12000);
   const listings = Array.isArray(stats?.listings) ? stats.listings : [];
 
   const byTicker = new Map();
@@ -85,9 +102,9 @@ async function getVariational() {
       exchange: "variational",
       symbol: sym,
       funding_rate_raw: rateAnnual,       // annual
-      funding_interval_s: 28800,          // normalize output to 8h
-      funding_rate_next_interval: rate8h, // next 8h
-      funding_rate_8h: rate8h,            // 8h normalized
+      funding_interval_s: 28800,
+      funding_rate_next_interval: rate8h,
+      funding_rate_8h: rate8h,
       mark_price: toNum(it.mark_price),
       source_ts: it?.quotes?.updated_at ?? null,
     });
@@ -95,9 +112,7 @@ async function getVariational() {
   return rows;
 }
 
-/** ---------------- Binance (NEXT / forward-looking 8h) ----------------
- * premiumIndex: { markPrice, lastFundingRate, nextFundingTime, ... }
- */
+/** ---------------- Binance ---------------- */
 async function getBinance() {
   const rows = [];
 
@@ -131,15 +146,11 @@ async function getBinance() {
   return rows;
 }
 
-/** ---------------- Lighter ----------------
- * - funding-rates 1 call
- * - strict symbol match on raw_symbol
- * - pick LAST candidate for each symbol
- */
+/** ---------------- Lighter ---------------- */
 async function getLighter() {
   let data;
   try {
-    data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`, 10000);
+    data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`, 12000);
   } catch (e) {
     console.log("[lighter] funding-rates failed:", String(e?.message || e));
     return [];
@@ -174,6 +185,7 @@ async function getLighter() {
     const rateRaw = toNum(
       pickField(picked, ["funding_rate", "fundingRate", "rate", "funding_rate_raw"])
     );
+
     const interval = toNum(
       pickField(picked, ["funding_interval_s", "fundingIntervalS", "interval_s", "intervalS"])
     ) ?? 28800;
@@ -185,8 +197,8 @@ async function getLighter() {
       exchange: "lighter",
       symbol: sym,
       funding_rate_raw: rateRaw,
-      funding_interval_s: 28800, // ✅ output always 8h for Apps Script consistency
-      funding_rate_next_interval: rateRaw,
+      funding_interval_s: 28800, // output always 8h
+      funding_rate_next_interval: normalizeTo8h(rateRaw, interval),
       funding_rate_8h: normalizeTo8h(rateRaw, interval),
       mark_price: mark,
       source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
@@ -202,23 +214,27 @@ async function getLighter() {
 
 /** ---------------- Hyperliquid ----------------
  * POST /info { type: "metaAndAssetCtxs" }
- *
- * IMPORTANT:
- *  - Response shape is typically: [ { universe: [{name:"BTC"}, ...] }, assetCtxsArray ]
- *  - assetCtxsArray items DO NOT necessarily include coin/name; they are aligned by universe index.
- *  - funding is typically per 1h -> normalize to 8h
+ * IMPORTANT: assetCtxs is index-aligned with universe (often ctx objects have no coin/name)
+ * funding is typically per 1h -> normalize to 8h
  */
 async function getHyperliquid() {
   let j;
   try {
-    j = await fetchJson(
+    j = await fetchJsonWithRetry(
       HYPERLIQUID_INFO,
-      12000,
+      15000,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          "accept": "application/json",
+          // Helps with occasional WAF/bot filtering in serverless environments
+          "user-agent": "Mozilla/5.0 (Vercel Serverless; funding-collector)",
+        },
         body: JSON.stringify({ type: "metaAndAssetCtxs" }),
-      }
+      },
+      3,
+      300
     );
   } catch (e) {
     console.log("[hyperliquid] metaAndAssetCtxs failed:", String(e?.message || e));
@@ -246,7 +262,7 @@ async function getHyperliquid() {
   if (!assetCtxs && Array.isArray(j?.data?.assetCtxs)) assetCtxs = j.data.assetCtxs;
 
   if (!Array.isArray(universe) || !Array.isArray(assetCtxs) || universe.length === 0 || assetCtxs.length === 0) {
-    console.log("[hyperliquid] unexpected shape:", JSON.stringify(j).slice(0, 300));
+    console.log("[hyperliquid] unexpected shape:", JSON.stringify(j).slice(0, 400));
     return [];
   }
 
@@ -282,7 +298,7 @@ async function getHyperliquid() {
       exchange: "hyperliquid",
       symbol: sym,
       funding_rate_raw: rate1h,       // 1h raw
-      funding_interval_s: 28800,      // ✅ output always 8h
+      funding_interval_s: 28800,      // output always 8h
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
       mark_price: mark,
@@ -302,11 +318,6 @@ async function getHyperliquid() {
  * Accepted JSON shapes:
  *   A) { rows: [{symbol, funding_rate_1h, mark_price, interval_s?}, ...] }
  *   B) [{symbol, funding_rate_1h, mark_price, interval_s?}, ...]
- *
- * Accepted keys:
- *   rate: funding_rate_1h | fundingRate1h | funding_rate | fundingRate
- *   mark: mark_price | markPrice | mark
- *   interval: interval_s | intervalS (default 3600)
  */
 async function getPluginExchange(exchangeName, envKey) {
   const url = process.env?.[envKey];
@@ -349,7 +360,7 @@ async function getPluginExchange(exchangeName, envKey) {
       exchange: exchangeName,
       symbol: sym,
       funding_rate_raw: rateRaw,
-      funding_interval_s: 28800,      // ✅ output always 8h
+      funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
       mark_price: mark,
@@ -398,22 +409,38 @@ export default async function handler(req, res) {
     return;
   }
 
+  const debug = String(req?.query?.debug || "") === "1";
+  const errors = [];
+
   try {
     const asOf = new Date().toISOString();
 
-    const [v, b, l, h, o1, nado] = await Promise.all([
-      getVariational(),
-      getBinance(),
-      getLighter(),
-      getHyperliquid(),
-      getPluginExchange("01xyz", "O1_FUNDING_URL"),
-      getPluginExchange("nado", "NADO_FUNDING_URL"),
-    ]);
+    // IMPORTANT: allSettled so one exchange failing doesn't kill the whole response
+    const tasks = [
+      ["variational", () => getVariational()],
+      ["binance", () => getBinance()],
+      ["lighter", () => getLighter()],
+      ["hyperliquid", () => getHyperliquid()],
+      ["01xyz", () => getPluginExchange("01xyz", "O1_FUNDING_URL")],
+      ["nado", () => getPluginExchange("nado", "NADO_FUNDING_URL")],
+    ];
 
-    const rows = [...v, ...b, ...l, ...h, ...o1, ...nado];
+    const settled = await Promise.allSettled(tasks.map(([, fn]) => fn()));
+
+    let rows = [];
+    for (let i = 0; i < settled.length; i++) {
+      const name = tasks[i][0];
+      const s = settled[i];
+      if (s.status === "fulfilled") {
+        if (Array.isArray(s.value)) rows = rows.concat(s.value);
+      } else {
+        errors.push({ exchange: name, error: String(s.reason?.message || s.reason) });
+      }
+    }
+
     fillMissingMarks(rows);
 
-    // 정렬(기존처럼)
+    // Sort
     const exOrder = {
       variational: 0,
       binance: 1,
@@ -434,8 +461,17 @@ export default async function handler(req, res) {
     // Apps Script 호출 대비 캐시
     res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=60");
 
-    res.status(200).json({ asOf, rows });
+    if (debug) {
+      res.status(200).json({ asOf, rows, errors });
+    } else {
+      res.status(200).json({ asOf, rows });
+    }
   } catch (e) {
-    res.status(500).json({ error: String(e?.message ?? e), asOf: new Date().toISOString(), rows: [] });
+    res.status(500).json({
+      error: String(e?.message ?? e),
+      asOf: new Date().toISOString(),
+      rows: [],
+      ...(debug ? { errors } : {}),
+    });
   }
 }
