@@ -1,9 +1,6 @@
 // api/funding-8h.js
-// Aggregates funding/mark from Variational, Binance, Lighter, Hyperliquid (+ optional plugins)
-// and normalizes everything to 8h.
-// Response shape (Apps Script friendly):
-//   { asOf: ISOString, rows: [...] }
-// Optional: add ?debug=1 to include { errors: [...] } in response.
+// Aggregates funding/mark from Variational, Binance, Lighter, Hyperliquid, 01.xyz, Nado
+// and normalizes everything to 8h for Apps Script (funding.gs) compatibility.
 
 const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
 
@@ -14,15 +11,18 @@ const BINANCE_SYMBOLS = {
   BNB: "BNBUSDT",
 };
 
-const VARIATIONAL_BASE =
-  "https://omni-client-api.prod.ap-northeast-1.variational.io";
-
+const VARIATIONAL_BASE = "https://omni-client-api.prod.ap-northeast-1.variational.io";
 const LIGHTER_BASE = "https://mainnet.zklighter.elliot.ai";
 
-// Hyperliquid info endpoint
+// Hyperliquid
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
-// --- helpers ---
+// 01.xyz (REST base in docs examples)
+const O1_BASE = "https://zo-mainnet.n1.xyz";
+
+// Nado (Gateway V2 base in docs)
+const NADO_GATEWAY_V2 = "https://gateway.prod.nado.xyz/v2";
+
 function toNum(x) {
   if (x === null || x === undefined) return null;
   const n = Number(x);
@@ -39,15 +39,14 @@ function pickField(obj, keys) {
 function annualTo8h(annualRate) {
   const r = toNum(annualRate);
   if (r === null) return null;
-  // 1 year ≈ 365 days, 3 funding windows/day => 1095 windows/year
-  return r / (365 * 3);
+  return r / (365 * 3); // 1095 windows/year
 }
 
-function normalizeTo8h(rate, intervalS) {
-  const r = toNum(rate);
+function normalizeTo8h(ratePerInterval, intervalS) {
+  const r = toNum(ratePerInterval);
   const s = toNum(intervalS);
   if (r === null) return null;
-  if (!s || s <= 0) return r; // fallback: assume already 8h-like
+  if (!s || s <= 0) return r; // assume already 8h-like
   return r * (28800 / s);
 }
 
@@ -64,24 +63,9 @@ async function fetchJson(url, timeoutMs = 8000, options = {}) {
   }
 }
 
-async function fetchJsonWithRetry(url, timeoutMs, options, tries = 3, baseDelayMs = 250) {
-  let lastErr = null;
-  for (let i = 0; i < tries; i++) {
-    try {
-      return await fetchJson(url, timeoutMs, options);
-    } catch (e) {
-      lastErr = e;
-      // simple backoff
-      const wait = baseDelayMs * Math.pow(2, i);
-      await new Promise((r) => setTimeout(r, wait));
-    }
-  }
-  throw lastErr;
-}
-
 /** ---------------- Variational ---------------- */
 async function getVariational() {
-  const stats = await fetchJson(`${VARIATIONAL_BASE}/metadata/stats`, 12000);
+  const stats = await fetchJson(`${VARIATIONAL_BASE}/metadata/stats`, 9000);
   const listings = Array.isArray(stats?.listings) ? stats.listings : [];
 
   const byTicker = new Map();
@@ -115,7 +99,6 @@ async function getVariational() {
 /** ---------------- Binance ---------------- */
 async function getBinance() {
   const rows = [];
-
   for (const sym of TARGETS) {
     const fSym = BINANCE_SYMBOLS[sym];
 
@@ -142,7 +125,6 @@ async function getBinance() {
       binance_source: "premiumIndex:lastFundingRate",
     });
   }
-
   return rows;
 }
 
@@ -150,7 +132,7 @@ async function getBinance() {
 async function getLighter() {
   let data;
   try {
-    data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`, 12000);
+    data = await fetchJson(`${LIGHTER_BASE}/api/v1/funding-rates`, 10000);
   } catch (e) {
     console.log("[lighter] funding-rates failed:", String(e?.message || e));
     return [];
@@ -185,7 +167,6 @@ async function getLighter() {
     const rateRaw = toNum(
       pickField(picked, ["funding_rate", "fundingRate", "rate", "funding_rate_raw"])
     );
-
     const interval = toNum(
       pickField(picked, ["funding_interval_s", "fundingIntervalS", "interval_s", "intervalS"])
     ) ?? 28800;
@@ -197,8 +178,8 @@ async function getLighter() {
       exchange: "lighter",
       symbol: sym,
       funding_rate_raw: rateRaw,
-      funding_interval_s: 28800, // output always 8h
-      funding_rate_next_interval: normalizeTo8h(rateRaw, interval),
+      funding_interval_s: 28800, // output fixed 8h
+      funding_rate_next_interval: rateRaw,
       funding_rate_8h: normalizeTo8h(rateRaw, interval),
       mark_price: mark,
       source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
@@ -212,61 +193,43 @@ async function getLighter() {
   return rows;
 }
 
-/** ---------------- Hyperliquid ----------------
- * POST /info { type: "metaAndAssetCtxs" }
- * IMPORTANT: assetCtxs is index-aligned with universe (often ctx objects have no coin/name)
- * funding is typically per 1h -> normalize to 8h
- */
+/** ---------------- Hyperliquid ---------------- */
 async function getHyperliquid() {
   let j;
   try {
-    j = await fetchJsonWithRetry(
+    j = await fetchJson(
       HYPERLIQUID_INFO,
-      15000,
+      12000,
       {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "accept": "application/json",
-          // Helps with occasional WAF/bot filtering in serverless environments
-          "user-agent": "Mozilla/5.0 (Vercel Serverless; funding-collector)",
-        },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({ type: "metaAndAssetCtxs" }),
-      },
-      3,
-      300
+      }
     );
   } catch (e) {
     console.log("[hyperliquid] metaAndAssetCtxs failed:", String(e?.message || e));
     return [];
   }
 
-  // Extract universe + assetCtxs robustly
   let universe = null;
   let assetCtxs = null;
 
-  // A) [ {universe:[...]}, [ ...ctxs ] ]
   if (Array.isArray(j) && j.length >= 2) {
     if (Array.isArray(j?.[0]?.universe)) universe = j[0].universe;
     if (Array.isArray(j?.[1])) assetCtxs = j[1];
   }
-
-  // B) { universe:[...], assetCtxs:[...] }
   if (!universe && Array.isArray(j?.universe)) universe = j.universe;
   if (!assetCtxs && Array.isArray(j?.assetCtxs)) assetCtxs = j.assetCtxs;
-
-  // C) { result:{universe:[...], assetCtxs:[...]} } / { data:{...} }
   if (!universe && Array.isArray(j?.result?.universe)) universe = j.result.universe;
   if (!assetCtxs && Array.isArray(j?.result?.assetCtxs)) assetCtxs = j.result.assetCtxs;
   if (!universe && Array.isArray(j?.data?.universe)) universe = j.data.universe;
   if (!assetCtxs && Array.isArray(j?.data?.assetCtxs)) assetCtxs = j.data.assetCtxs;
 
-  if (!Array.isArray(universe) || !Array.isArray(assetCtxs) || universe.length === 0 || assetCtxs.length === 0) {
-    console.log("[hyperliquid] unexpected shape:", JSON.stringify(j).slice(0, 400));
+  if (!Array.isArray(universe) || !Array.isArray(assetCtxs) || !universe.length || !assetCtxs.length) {
+    console.log("[hyperliquid] unexpected shape:", JSON.stringify(j).slice(0, 300));
     return [];
   }
 
-  // Build name -> ctx using universe index alignment
   const byName = new Map();
   const n = Math.min(universe.length, assetCtxs.length);
   for (let i = 0; i < n; i++) {
@@ -297,8 +260,8 @@ async function getHyperliquid() {
     rows.push({
       exchange: "hyperliquid",
       symbol: sym,
-      funding_rate_raw: rate1h,       // 1h raw
-      funding_interval_s: 28800,      // output always 8h
+      funding_rate_raw: rate1h,  // 1h raw
+      funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
       mark_price: mark,
@@ -310,35 +273,125 @@ async function getHyperliquid() {
   return rows;
 }
 
-/** ---------------- Plugin exchanges (01xyz / nado 등) ----------------
- * ENV:
- *   - O1_FUNDING_URL
- *   - NADO_FUNDING_URL
- *
- * Accepted JSON shapes:
- *   A) { rows: [{symbol, funding_rate_1h, mark_price, interval_s?}, ...] }
- *   B) [{symbol, funding_rate_1h, mark_price, interval_s?}, ...]
+/** ---------------- 01.xyz ----------------
+ * 1) GET /info  -> market list (id + symbol mapping)
+ * 2) GET /market/{id}/stats -> perpStats.funding_rate (hourly) + mark_price
  */
-async function getPluginExchange(exchangeName, envKey) {
-  const url = process.env?.[envKey];
-  if (!url) return [];
+function normalize01Symbol(s) {
+  const u = String(s || "").toUpperCase().trim();
+  // common patterns: "BTC-PERP", "BTC_PERP", "BTC", "PERP_BTC"
+  for (const base of TARGETS) {
+    if (u === base) return base;
+    if (u === `${base}-PERP` || u === `${base}_PERP` || u === `${base}PERP`) return base;
+    if (u.includes(base) && u.includes("PERP")) return base;
+  }
+  return null;
+}
 
-  let j;
+async function get01xyz() {
+  let info;
   try {
-    j = await fetchJson(url, 12000);
+    info = await fetchJson(`${O1_BASE}/info`, 9000);
   } catch (e) {
-    console.log(`[${exchangeName}] plugin fetch failed:`, String(e?.message || e));
+    console.log("[01xyz] /info failed:", String(e?.message || e));
     return [];
   }
 
-  const items = Array.isArray(j) ? j : Array.isArray(j?.rows) ? j.rows : [];
-  if (!Array.isArray(items) || items.length === 0) return [];
+  const markets = Array.isArray(info?.markets) ? info.markets : [];
+  if (!markets.length) return [];
+
+  // sym -> marketId
+  const idBySym = new Map();
+  for (const m of markets) {
+    const mSymRaw = pickField(m, ["symbol", "name", "ticker"]);
+    const sym = normalize01Symbol(mSymRaw);
+    const id = toNum(pickField(m, ["id", "market_id", "marketId"]));
+    if (sym && id != null) {
+      // keep first match
+      if (!idBySym.has(sym)) idBySym.set(sym, id);
+    }
+  }
+
+  const rows = [];
+  for (const sym of TARGETS) {
+    const id = idBySym.get(sym);
+    if (id == null) continue;
+
+    let st;
+    try {
+      st = await fetchJson(`${O1_BASE}/market/${id}/stats`, 9000);
+    } catch (e) {
+      console.log(`[01xyz] /market/${id}/stats failed:`, String(e?.message || e));
+      continue;
+    }
+
+    const perpStats = st?.perpStats ?? st?.perp_stats ?? st?.perp ?? null;
+
+    // docs show perpStats.funding_rate (hourly) & mark_price in stats response
+    const rate1h = toNum(
+      pickField(perpStats || st, ["funding_rate", "fundingRate", "funding"])
+    ) ?? 0;
+
+    const mark = toNum(
+      pickField(perpStats || st, ["mark_price", "markPrice", "mark"])
+    );
+
+    const rate8h = normalizeTo8h(rate1h, 3600);
+
+    rows.push({
+      exchange: "01xyz",
+      symbol: sym,
+      funding_rate_raw: rate1h, // 1h raw
+      funding_interval_s: 28800,
+      funding_rate_next_interval: rate8h,
+      funding_rate_8h: rate8h,
+      mark_price: mark,
+      source_ts: null,
+      o1_source: "REST: /info + /market/{id}/stats (funding~1h)",
+      o1_market_id: id,
+    });
+  }
+
+  return rows;
+}
+
+/** ---------------- Nado ----------------
+ * Use Gateway V2. Contract list includes funding_rate (24h) per docs.
+ * Convert 24h -> 8h by dividing by 3.
+ */
+async function getNado() {
+  let j;
+  try {
+    j = await fetchJson(`${NADO_GATEWAY_V2}/contracts`, 9000);
+  } catch (e) {
+    console.log("[nado] /v2/contracts failed:", String(e?.message || e));
+    return [];
+  }
+
+  const items = Array.isArray(j) ? j : Array.isArray(j?.contracts) ? j.contracts : [];
+  if (!Array.isArray(items) || !items.length) return [];
 
   const bySym = new Map();
   for (const it of items) {
-    const sym = String(it?.symbol || "").toUpperCase();
-    if (!TARGETS.includes(sym)) continue;
-    bySym.set(sym, it);
+    const raw = String(
+      pickField(it, ["symbol", "ticker", "name", "base_asset", "baseAsset"]) || ""
+    ).toUpperCase();
+
+    // try strict match first (BTC/ETH/SOL/BNB)
+    let sym = TARGETS.includes(raw) ? raw : null;
+
+    // or parse things like "BTC-PERP"
+    if (!sym) {
+      for (const base of TARGETS) {
+        if (raw === `${base}-PERP` || raw === `${base}_PERP` || (raw.includes(base) && raw.includes("PERP"))) {
+          sym = base;
+          break;
+        }
+      }
+    }
+
+    if (!sym) continue;
+    if (!bySym.has(sym)) bySym.set(sym, it);
   }
 
   const rows = [];
@@ -346,26 +399,24 @@ async function getPluginExchange(exchangeName, envKey) {
     const it = bySym.get(sym);
     if (!it) continue;
 
-    const interval = toNum(pickField(it, ["interval_s", "intervalS"])) ?? 3600;
+    // docs: funding_rate is 24h funding rate
+    const rate24h = toNum(pickField(it, ["funding_rate", "fundingRate"])) ?? 0;
+    const rate8h = rate24h / 3;
 
-    const rateRaw =
-      toNum(pickField(it, ["funding_rate_1h", "fundingRate1h", "funding_rate", "fundingRate"])) ?? 0;
-
-    const mark =
-      toNum(pickField(it, ["mark_price", "markPrice", "mark"])) ?? null;
-
-    const rate8h = normalizeTo8h(rateRaw, interval);
+    const mark = toNum(
+      pickField(it, ["mark_price", "markPrice", "mark", "oracle_price", "oraclePrice", "index_price", "indexPrice"])
+    );
 
     rows.push({
-      exchange: exchangeName,
+      exchange: "nado",
       symbol: sym,
-      funding_rate_raw: rateRaw,
+      funding_rate_raw: rate24h, // 24h raw
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
       mark_price: mark,
       source_ts: null,
-      plugin_source: envKey,
+      nado_source: "Gateway V2 /contracts (funding_rate=24h)",
     });
   }
 
@@ -373,7 +424,6 @@ async function getPluginExchange(exchangeName, envKey) {
 }
 
 function fillMissingMarks(rows) {
-  // Prefer binance marks as fallback, then variational, then hyperliquid, then anything
   const markBySymbol = new Map();
 
   for (const r of rows) {
@@ -409,38 +459,21 @@ export default async function handler(req, res) {
     return;
   }
 
-  const debug = String(req?.query?.debug || "") === "1";
-  const errors = [];
-
   try {
     const asOf = new Date().toISOString();
 
-    // IMPORTANT: allSettled so one exchange failing doesn't kill the whole response
-    const tasks = [
-      ["variational", () => getVariational()],
-      ["binance", () => getBinance()],
-      ["lighter", () => getLighter()],
-      ["hyperliquid", () => getHyperliquid()],
-      ["01xyz", () => getPluginExchange("01xyz", "O1_FUNDING_URL")],
-      ["nado", () => getPluginExchange("nado", "NADO_FUNDING_URL")],
-    ];
+    const [v, b, l, h, o1, nado] = await Promise.all([
+      getVariational(),
+      getBinance(),
+      getLighter(),
+      getHyperliquid(),
+      get01xyz(),
+      getNado(),
+    ]);
 
-    const settled = await Promise.allSettled(tasks.map(([, fn]) => fn()));
-
-    let rows = [];
-    for (let i = 0; i < settled.length; i++) {
-      const name = tasks[i][0];
-      const s = settled[i];
-      if (s.status === "fulfilled") {
-        if (Array.isArray(s.value)) rows = rows.concat(s.value);
-      } else {
-        errors.push({ exchange: name, error: String(s.reason?.message || s.reason) });
-      }
-    }
-
+    const rows = [...v, ...b, ...l, ...h, ...o1, ...nado];
     fillMissingMarks(rows);
 
-    // Sort
     const exOrder = {
       variational: 0,
       binance: 1,
@@ -461,17 +494,12 @@ export default async function handler(req, res) {
     // Apps Script 호출 대비 캐시
     res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=60");
 
-    if (debug) {
-      res.status(200).json({ asOf, rows, errors });
-    } else {
-      res.status(200).json({ asOf, rows });
-    }
+    res.status(200).json({ asOf, rows });
   } catch (e) {
     res.status(500).json({
       error: String(e?.message ?? e),
       asOf: new Date().toISOString(),
       rows: [],
-      ...(debug ? { errors } : {}),
     });
   }
 }
