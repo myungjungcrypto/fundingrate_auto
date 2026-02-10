@@ -371,14 +371,13 @@ async function getNado() {
   // 1) get symbols to map product_id
   let symResp;
   try {
-    // Many Nado endpoints are via POST /query style. If yours differs, override via env.
     symResp = await fetchJson(
       NADO_GATEWAY_ENDPOINT,
       12000,
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ symbols: {} }),
+        body: JSON.stringify({ type: "symbols" }),
       }
     );
   } catch (e) {
@@ -386,7 +385,7 @@ async function getNado() {
     return [];
   }
 
-  // Try common shapes
+  // Docs show /query often returns object; try multiple shapes
   const symbols =
     Array.isArray(symResp) ? symResp :
     Array.isArray(symResp?.symbols) ? symResp.symbols :
@@ -395,7 +394,7 @@ async function getNado() {
     [];
 
   if (!Array.isArray(symbols) || !symbols.length) {
-    console.log("[nado] symbols empty, shape:", JSON.stringify(symResp).slice(0, 200));
+    console.log("[nado] symbols empty, shape:", JSON.stringify(symResp).slice(0, 300));
     return [];
   }
 
@@ -406,7 +405,6 @@ async function getNado() {
     const productId = toNum(s?.product_id ?? s?.productId ?? s?.id);
     if (productId == null) continue;
 
-    // Match BTC/ETH/SOL/BNB perp products: "BTC-PERP" etc
     for (const sym of TARGETS) {
       if (productBySym.has(sym)) continue;
       if (raw.includes(sym) && raw.includes("PERP")) productBySym.set(sym, productId);
@@ -414,9 +412,12 @@ async function getNado() {
   }
 
   const productIds = Array.from(productBySym.values());
-  if (!productIds.length) return [];
+  if (!productIds.length) {
+    console.log("[nado] no perp productIds found");
+    return [];
+  }
 
-  // 2) query funding rates (24h) from archive
+  // 2) query funding rates from archive
   let frResp;
   try {
     frResp = await fetchJson(
@@ -425,7 +426,7 @@ async function getNado() {
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ funding_rates: { product_ids: productIds } }),
+        body: JSON.stringify({ type: "funding_rates", product_ids: productIds }),
       }
     );
   } catch (e) {
@@ -433,11 +434,14 @@ async function getNado() {
     return [];
   }
 
-  // Response is map: { "2": { product_id, funding_rate_x18, update_time }, ... }
+  // The archive response in docs is a map keyed by product_id
   const mapObj = (frResp && typeof frResp === "object") ? frResp : null;
-  if (!mapObj) return [];
+  if (!mapObj) {
+    console.log("[nado] funding_rates unexpected shape:", JSON.stringify(frResp).slice(0, 300));
+    return [];
+  }
 
-  const byPid = new Map(); // pid -> data
+  const byPid = new Map();
   for (const [k, v] of Object.entries(mapObj)) {
     const pid = toNum(v?.product_id ?? k);
     if (pid == null) continue;
@@ -452,6 +456,7 @@ async function getNado() {
     const v = byPid.get(pid);
     if (!v) continue;
 
+    // docs: funding_rate_x18 = 24hr funding rate * 1e18
     const x18 = v?.funding_rate_x18 ?? v?.fundingRateX18 ?? null;
     const rate24h = x18 == null ? null : (Number(x18) / 1e18);
     const rate8h = rate24h == null ? null : (rate24h / 3);
@@ -467,10 +472,10 @@ async function getNado() {
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
-      mark_price: null, // will be filled by fillMissingMarks
+      mark_price: null,
       source_ts: updIso,
       nado_product_id: pid,
-      nado_source: "archive funding_rates (24h -> 8h by /3)",
+      nado_source: "query:type=symbols + archive:type=funding_rates (24h->8h /3)",
     });
   }
 
