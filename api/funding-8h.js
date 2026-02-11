@@ -1,7 +1,6 @@
 // funding-8h.js
 // Aggregates funding/mark from Variational, Binance, Lighter, Hyperliquid, 01.xyz, Nado
 // and normalizes everything to 8h.
-// Output schema is kept compatible with your funding.gs Apps Script pipeline.
 
 const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
 
@@ -20,10 +19,10 @@ const LIGHTER_BASE = "https://mainnet.zklighter.elliot.ai";
 // Hyperliquid
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
-// 01.xyz (docs: https://docs.01.xyz/)
+// 01.xyz
 const O1_BASE = "https://zo-mainnet.n1.xyz";
 
-// Nado (docs: https://docs.nado.xyz/developer-resources/api/endpoints)
+// Nado
 const NADO_GATEWAY = "https://gateway.prod.nado.xyz/v1";
 const NADO_ARCHIVE = "https://archive.prod.nado.xyz/v1";
 
@@ -43,7 +42,6 @@ function pickField(obj, keys) {
 function annualTo8h(annualRate) {
   const r = toNum(annualRate);
   if (r === null) return null;
-  // 1 year ≈ 365 days, 3 funding windows/day => 1095 windows/year
   return r / (365 * 3);
 }
 
@@ -90,9 +88,9 @@ async function getVariational() {
     rows.push({
       exchange: "variational",
       symbol: sym,
-      funding_rate_raw: rateAnnual,       // annual
+      funding_rate_raw: rateAnnual,
       funding_interval_s: 28800,
-      funding_rate_next_interval: rate8h, // 8h
+      funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
       mark_price: toNum(it.mark_price),
       source_ts: it?.quotes?.updated_at ?? null,
@@ -262,7 +260,7 @@ async function getHyperliquid() {
     rows.push({
       exchange: "hyperliquid",
       symbol: sym,
-      funding_rate_raw: rate1h,       // 1h raw
+      funding_rate_raw: rate1h,
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
@@ -275,10 +273,7 @@ async function getHyperliquid() {
   return rows;
 }
 
-/** ---------------- 01.xyz ----------------
- * Use /info to map market_id per target
- * Then /market/{id}/stats -> perpStats.hourly_funding_rate (1h) + mark_price + next_funding_time
- */
+/** ---------------- 01.xyz ---------------- */
 async function get01xyz() {
   let info;
   try {
@@ -294,8 +289,6 @@ async function get01xyz() {
     return [];
   }
 
-  // Build symbol -> market_id mapping
-  // Common patterns seen in 01: "BTCUSD", "BTC-PERP", etc. We'll try multiple matches.
   const bySym = new Map();
   for (const m of markets) {
     const mid = toNum(m?.market_id ?? m?.id);
@@ -305,14 +298,12 @@ async function get01xyz() {
     const s2 = String(m?.name || "").toUpperCase();
     const base = String(m?.base_symbol || m?.base || m?.base_asset || "").toUpperCase();
 
-    // prefer explicit base if present
     const key = base || (s1.startsWith("BTC") ? "BTC" :
                          s1.startsWith("ETH") ? "ETH" :
                          s1.startsWith("SOL") ? "SOL" :
                          s1.startsWith("BNB") ? "BNB" : "");
 
     if (TARGETS.includes(key)) {
-      // keep first match, but allow overwrite with more "perp-ish" symbol
       const isPerpish = s1.includes("PERP") || s2.includes("PERP") || s1.includes("-PERP") || s1.includes("SWAP");
       if (!bySym.has(key)) bySym.set(key, { market_id: mid, sym: s1 || s2, score: isPerpish ? 2 : 1 });
       else {
@@ -370,7 +361,7 @@ async function get01xyz() {
     rows.push({
       exchange: "01xyz",
       symbol: sym,
-      funding_rate_raw: rate1h,      // 1h
+      funding_rate_raw: rate1h,
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
@@ -385,12 +376,7 @@ async function get01xyz() {
   return rows;
 }
 
-/** ---------------- Nado ----------------
- * 1) GET gateway /v1/symbols to get product_id by "BTC-PERP" etc.
- * 2) POST archive /v1 with { funding_rates: { product_ids: [...] } }
- *    Response is a map: product_id -> { funding_rate_x18, update_time }
- *    funding_rate_x18 is 24hr funding rate scaled by 1e18 -> convert -> 8h = 24h/3
- */
+/** ---------------- Nado (FIXED symbols parsing) ---------------- */
 async function getNado() {
   // 1) symbols
   let symbolsRes;
@@ -401,29 +387,48 @@ async function getNado() {
     return [];
   }
 
-  // docs show map-like response under data.symbols (not an array)
-  const symbolsMap = symbolsRes?.data?.symbols || symbolsRes?.symbols || null;
-  if (!symbolsMap || typeof symbolsMap !== "object") {
+  // Accept BOTH:
+  // A) array: [{product_id, symbol, ...}, ...]  <-- your current response
+  // B) map/object: { "SOL-PERP": {...}, ... } or { data:{symbols:{...}} }
+  let symbolsList = null;
+
+  if (Array.isArray(symbolsRes)) {
+    symbolsList = symbolsRes;
+  } else if (Array.isArray(symbolsRes?.data)) {
+    symbolsList = symbolsRes.data;
+  } else if (Array.isArray(symbolsRes?.symbols)) {
+    symbolsList = symbolsRes.symbols;
+  } else {
+    const symbolsMap = symbolsRes?.data?.symbols || symbolsRes?.symbols || null;
+    if (symbolsMap && typeof symbolsMap === "object" && !Array.isArray(symbolsMap)) {
+      symbolsList = Object.values(symbolsMap);
+    }
+  }
+
+  if (!Array.isArray(symbolsList) || symbolsList.length === 0) {
     console.log("[nado] symbols empty/invalid shape:", JSON.stringify(symbolsRes).slice(0, 250));
     return [];
   }
 
-  // target -> product_id (e.g., "SOL-PERP")
+  // target -> product_id by exact "BTC-PERP" etc.
   const prodBySym = new Map();
-  for (const sym of TARGETS) {
-    const key = `${sym}-PERP`;
-    const it = symbolsMap[key] || symbolsMap[key.toLowerCase()] || null;
+  const want = new Set(TARGETS.map((s) => `${s}-PERP`));
+
+  for (const it of symbolsList) {
+    const s = String(it?.symbol || "").toUpperCase();
+    if (!want.has(s)) continue;
+    const base = s.replace("-PERP", "");
     const pid = toNum(it?.product_id ?? it?.productId);
-    if (pid !== null) prodBySym.set(sym, { product_id: pid, symbol_key: key });
+    if (TARGETS.includes(base) && pid !== null) prodBySym.set(base, { product_id: pid, symbol_key: s });
   }
 
   const productIds = Array.from(prodBySym.values()).map((x) => x.product_id);
   if (!productIds.length) {
-    console.log("[nado] no product_ids found for targets. keys present sample:", Object.keys(symbolsMap).slice(0, 10));
+    console.log("[nado] no product_ids found. sample symbols:", symbolsList.slice(0, 10).map((x) => x.symbol));
     return [];
   }
 
-  // 2) funding rates (24h) via archive POST [ARCHIVE_ENDPOINT]
+  // 2) funding rates (archive)
   let fr;
   try {
     fr = await fetchJson(
@@ -442,16 +447,26 @@ async function getNado() {
     return [];
   }
 
-  // response is a map: { "2": { product_id, funding_rate_x18, update_time }, ... }
-  const frMap = fr && typeof fr === "object" ? fr : null;
-  if (!frMap || Array.isArray(frMap)) {
+  // Accept shapes:
+  // A) { "2": { product_id, funding_rate_x18, update_time }, ... }
+  // B) { status:"success", data:{ funding_rates:{...} } } (if wrapped)
+  const frMap =
+    (fr && typeof fr === "object" && !Array.isArray(fr) ? fr : null) ||
+    null;
+
+  const inner =
+    frMap?.data?.funding_rates ||
+    frMap?.data ||
+    frMap?.funding_rates ||
+    frMap;
+
+  if (!inner || typeof inner !== "object" || Array.isArray(inner)) {
     console.log("[nado] funding_rates invalid shape:", JSON.stringify(fr).slice(0, 250));
     return [];
   }
 
-  // Build product_id -> record
   const recByPid = new Map();
-  for (const [k, v] of Object.entries(frMap)) {
+  for (const [k, v] of Object.entries(inner)) {
     const pid = toNum(v?.product_id ?? k);
     if (pid === null) continue;
     recByPid.set(pid, v);
@@ -477,11 +492,11 @@ async function getNado() {
     rows.push({
       exchange: "nado",
       symbol: sym,
-      funding_rate_raw: r24,        // 24h raw (note!)
+      funding_rate_raw: r24, // 24h raw
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
-      mark_price: null,             // we can add mark via another endpoint later
+      mark_price: null,
       source_ts: sourceIso,
       nado_product_id: p.product_id,
       nado_symbol: p.symbol_key,
@@ -518,7 +533,6 @@ function fillMissingMarks(rows) {
 }
 
 export default async function handler(req, res) {
-  // CORS / preflight (Apps Script & browser safe)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -560,9 +574,7 @@ export default async function handler(req, res) {
         TARGETS.indexOf(String(b.symbol || "").toUpperCase());
     });
 
-    // Apps Script 호출 대비 캐시
     res.setHeader("Cache-Control", "s-maxage=10, stale-while-revalidate=60");
-
     res.status(200).json({ asOf, rows });
   } catch (e) {
     res.status(500).json({ error: String(e?.message ?? e), asOf: new Date().toISOString(), rows: [] });
