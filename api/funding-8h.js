@@ -22,7 +22,7 @@ const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 // 01.xyz
 const O1_BASE = "https://zo-mainnet.n1.xyz";
 
-// Nado
+// Nado (Gateway/Archive endpoints are /v1, per docs)
 const NADO_GATEWAY = "https://gateway.prod.nado.xyz/v1";
 const NADO_ARCHIVE = "https://archive.prod.nado.xyz/v1";
 
@@ -273,7 +273,11 @@ async function getHyperliquid() {
   return rows;
 }
 
-/** ---------------- 01.xyz ---------------- */
+/** ---------------- 01.xyz ----------------
+ * Docs:
+ *  - GET /info -> markets[] (market_id, symbol, ...)
+ *  - GET /market/{market_id}/stats -> perpStats.funding_rate (hourly), perpStats.next_funding_time (ISO), etc.
+ */
 async function get01xyz() {
   let info;
   try {
@@ -289,50 +293,77 @@ async function get01xyz() {
     return [];
   }
 
-  const bySym = new Map();
+  // Build candidate market_ids per symbol (we will probe /stats until we find perpStats)
+  const candBySym = new Map();
   for (const m of markets) {
-    const mid = toNum(m?.market_id ?? m?.id);
+    const mid = toNum(m?.market_id ?? m?.marketId ?? m?.id);
     if (mid === null) continue;
 
-    const s1 = String(m?.symbol || "").toUpperCase();
-    const s2 = String(m?.name || "").toUpperCase();
-    const base = String(m?.base_symbol || m?.base || m?.base_asset || "").toUpperCase();
+    const sym = String(m?.symbol || "").toUpperCase(); // e.g. BTCUSD
+    for (const base of TARGETS) {
+      if (!sym.includes(base)) continue;
+      // prefer "BASEUSD" exact-ish
+      const score =
+        (sym === `${base}USD` ? 3 :
+        (sym.startsWith(base) && sym.endsWith("USD") ? 2 :
+        sym.startsWith(base) ? 1 : 0));
+      if (score <= 0) continue;
 
-    const key = base || (s1.startsWith("BTC") ? "BTC" :
-                         s1.startsWith("ETH") ? "ETH" :
-                         s1.startsWith("SOL") ? "SOL" :
-                         s1.startsWith("BNB") ? "BNB" : "");
-
-    if (TARGETS.includes(key)) {
-      const isPerpish = s1.includes("PERP") || s2.includes("PERP") || s1.includes("-PERP") || s1.includes("SWAP");
-      if (!bySym.has(key)) bySym.set(key, { market_id: mid, sym: s1 || s2, score: isPerpish ? 2 : 1 });
-      else {
-        const prev = bySym.get(key);
-        const score = isPerpish ? 2 : 1;
-        if (score > prev.score) bySym.set(key, { market_id: mid, sym: s1 || s2, score });
-      }
+      if (!candBySym.has(base)) candBySym.set(base, []);
+      candBySym.get(base).push({ market_id: mid, market_symbol: sym, score });
     }
   }
 
-  const rows = [];
-  for (const sym of TARGETS) {
-    const hit = bySym.get(sym);
-    if (!hit) continue;
+  // sort candidates by score desc (best first)
+  for (const base of TARGETS) {
+    const c = candBySym.get(base) || [];
+    c.sort((a, b) => (b.score - a.score) || (a.market_id - b.market_id));
+    candBySym.set(base, c);
+  }
 
-    let st;
-    try {
-      st = await fetchJson(`${O1_BASE}/market/${hit.market_id}/stats`, 12000);
-    } catch (e) {
-      console.log(`[01xyz] stats failed sym=${sym} market_id=${hit.market_id}:`, String(e?.message || e));
+  const rows = [];
+  for (const base of TARGETS) {
+    const cands = candBySym.get(base) || [];
+    if (!cands.length) continue;
+
+    // probe up to 6 candidates until perpStats exists
+    let picked = null;
+    let st = null;
+
+    for (let i = 0; i < Math.min(6, cands.length); i++) {
+      const c = cands[i];
+      try {
+        st = await fetchJson(`${O1_BASE}/market/${c.market_id}/stats`, 12000);
+      } catch (e) {
+        console.log(`[01xyz] /market/${c.market_id}/stats failed base=${base}:`, String(e?.message || e));
+        continue;
+      }
+      const perp = st?.perpStats || st?.perp_stats || null;
+      if (perp && (perp.funding_rate != null || perp.fundingRate != null)) {
+        picked = c;
+        break;
+      }
+    }
+
+    if (!picked || !st) {
+      console.log(`[01xyz] no perpStats found base=${base}. tried=${Math.min(6, cands.length)}`);
       continue;
     }
 
-    const perp = st?.perpStats || st?.perp_stats || null;
+    const perp = st?.perpStats || st?.perp_stats;
+
+    // docs: perpStats.funding_rate is HOURLY (1h) funding. normalize -> 8h
     const rate1h =
-      toNum(perp?.hourly_funding_rate) ??
-      toNum(perp?.hourlyFundingRate) ??
+      toNum(perp?.funding_rate) ??
+      toNum(perp?.fundingRate) ??
       toNum(perp?.funding_rate_1h) ??
+      toNum(perp?.hourly_funding_rate) ??
       null;
+
+    if (rate1h === null) {
+      console.log(`[01xyz] missing funding_rate base=${base} market_id=${picked.market_id} shape=`, JSON.stringify(st).slice(0, 250));
+      continue;
+    }
 
     const mark =
       toNum(st?.mark_price) ??
@@ -341,42 +372,37 @@ async function get01xyz() {
       toNum(perp?.markPrice) ??
       null;
 
-    const nextTs =
-      pickField(perp, ["next_funding_time", "nextFundingTime", "next_funding_ts"]) ??
-      pickField(st, ["next_funding_time", "nextFundingTime"]) ??
-      null;
-
+    // docs: perpStats.next_funding_time is ISO string
     const nextIso =
-      nextTs != null && Number.isFinite(Number(nextTs))
-        ? new Date(Number(nextTs) * (String(nextTs).length <= 10 ? 1000 : 1)).toISOString()
-        : null;
-
-    if (rate1h === null) {
-      console.log(`[01xyz] missing hourly_funding_rate sym=${sym} market_id=${hit.market_id} shape=`, JSON.stringify(st).slice(0, 250));
-      continue;
-    }
+      (typeof perp?.next_funding_time === "string" ? perp.next_funding_time : null) ??
+      (typeof perp?.nextFundingTime === "string" ? perp.nextFundingTime : null) ??
+      null;
 
     const rate8h = normalizeTo8h(rate1h, 3600);
 
     rows.push({
       exchange: "01xyz",
-      symbol: sym,
-      funding_rate_raw: rate1h,
+      symbol: base,
+      funding_rate_raw: rate1h,       // 1h raw
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
       mark_price: mark,
       source_ts: nextIso,
-      o1_market_id: hit.market_id,
-      o1_market_symbol: hit.sym,
-      o1_source: "/info + /market/{id}/stats (perpStats.hourly_funding_rate)",
+      o1_market_id: picked.market_id,
+      o1_market_symbol: picked.market_symbol,
+      o1_source: "/info + /market/{id}/stats (perpStats.funding_rate ~ 1h)",
     });
   }
 
   return rows;
 }
 
-/** ---------------- Nado (FIXED symbols parsing) ---------------- */
+/** ---------------- Nado ----------------
+ * Gateway: GET /v1/symbols
+ * Archive: POST /v1 with body { funding_rates: { product_ids: [...] } }
+ * funding_rate_x18 is 24h funding; convert -> 8h by /3
+ */
 async function getNado() {
   // 1) symbols
   let symbolsRes;
@@ -387,17 +413,15 @@ async function getNado() {
     return [];
   }
 
-  // Accept BOTH:
-  // A) array: [{product_id, symbol, ...}, ...]  <-- your current response
-  // B) map/object: { "SOL-PERP": {...}, ... } or { data:{symbols:{...}} }
+  // Accept:
+  // A) array: [{product_id, symbol, ...}, ...]
+  // B) { status:"success", data:{ symbols:{ "SOL-PERP": {...}, ... } } }
   let symbolsList = null;
 
   if (Array.isArray(symbolsRes)) {
     symbolsList = symbolsRes;
   } else if (Array.isArray(symbolsRes?.data)) {
     symbolsList = symbolsRes.data;
-  } else if (Array.isArray(symbolsRes?.symbols)) {
-    symbolsList = symbolsRes.symbols;
   } else {
     const symbolsMap = symbolsRes?.data?.symbols || symbolsRes?.symbols || null;
     if (symbolsMap && typeof symbolsMap === "object" && !Array.isArray(symbolsMap)) {
@@ -410,8 +434,7 @@ async function getNado() {
     return [];
   }
 
-  // target -> product_id by exact "BTC-PERP" etc.
-  const prodBySym = new Map();
+  const prodByBase = new Map();
   const want = new Set(TARGETS.map((s) => `${s}-PERP`));
 
   for (const it of symbolsList) {
@@ -419,10 +442,12 @@ async function getNado() {
     if (!want.has(s)) continue;
     const base = s.replace("-PERP", "");
     const pid = toNum(it?.product_id ?? it?.productId);
-    if (TARGETS.includes(base) && pid !== null) prodBySym.set(base, { product_id: pid, symbol_key: s });
+    if (TARGETS.includes(base) && pid !== null) {
+      prodByBase.set(base, { product_id: pid, symbol_key: s });
+    }
   }
 
-  const productIds = Array.from(prodBySym.values()).map((x) => x.product_id);
+  const productIds = Array.from(prodByBase.values()).map((x) => x.product_id);
   if (!productIds.length) {
     console.log("[nado] no product_ids found. sample symbols:", symbolsList.slice(0, 10).map((x) => x.symbol));
     return [];
@@ -447,18 +472,12 @@ async function getNado() {
     return [];
   }
 
-  // Accept shapes:
-  // A) { "2": { product_id, funding_rate_x18, update_time }, ... }
-  // B) { status:"success", data:{ funding_rates:{...} } } (if wrapped)
-  const frMap =
-    (fr && typeof fr === "object" && !Array.isArray(fr) ? fr : null) ||
-    null;
-
+  // Response is typically a map: { "2": { product_id, funding_rate_x18, update_time }, ... }
   const inner =
-    frMap?.data?.funding_rates ||
-    frMap?.data ||
-    frMap?.funding_rates ||
-    frMap;
+    fr?.data?.funding_rates ||
+    fr?.funding_rates ||
+    fr?.data ||
+    fr;
 
   if (!inner || typeof inner !== "object" || Array.isArray(inner)) {
     console.log("[nado] funding_rates invalid shape:", JSON.stringify(fr).slice(0, 250));
@@ -473,8 +492,8 @@ async function getNado() {
   }
 
   const rows = [];
-  for (const sym of TARGETS) {
-    const p = prodBySym.get(sym);
+  for (const base of TARGETS) {
+    const p = prodByBase.get(base);
     if (!p) continue;
 
     const rec = recByPid.get(p.product_id);
@@ -491,7 +510,7 @@ async function getNado() {
 
     rows.push({
       exchange: "nado",
-      symbol: sym,
+      symbol: base,
       funding_rate_raw: r24, // 24h raw
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
@@ -500,7 +519,7 @@ async function getNado() {
       source_ts: sourceIso,
       nado_product_id: p.product_id,
       nado_symbol: p.symbol_key,
-      nado_source: "gateway:/symbols + archive:funding_rates (24h -> 8h)",
+      nado_source: "gateway:/v1/symbols + archive:/v1 (funding_rates, 24h -> 8h)",
     });
   }
 
