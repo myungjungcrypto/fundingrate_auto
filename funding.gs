@@ -44,7 +44,7 @@ const FUNDING_SHEET_HOURLY = "lighter_hourly_history"; // legacy name 유지
 const FUNDING_SHEET_LIGHTER_HOURLY = "lighter_hourly_history";
 
 const FUNDING_HOURLY_EXCHANGES_CONFIG_KEY = "hourly_exchanges";
-const FUNDING_DEFAULT_HOURLY_EXCHANGES = ["lighter", "hyperliquid", "01xyz"];
+const FUNDING_DEFAULT_HOURLY_EXCHANGES = ["lighter", "hyperliquid", "01xyz", "nado", "pacifica", "extended"];
 const FUNDING_HOURLY_SOURCE_INTERVAL_MAX_S = 3600;
 const FUNDING_HOURLY_LOOKBACK_HOURS = 8;
 const FUNDING_LAST_SLOT_KEY_HOURLY = "FUNDING_LAST_SLOT_KEY_HOURLY";

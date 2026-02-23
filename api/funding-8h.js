@@ -1,6 +1,6 @@
 // funding-8h.js
-// Aggregates funding/mark from Variational, Binance, Lighter, Hyperliquid, 01.xyz, Nado
-// and normalizes everything to 8h.
+// Aggregates funding/mark from Variational, Binance, Lighter, Hyperliquid, 01.xyz,
+// Nado, Pacifica, Paradex, Extended and normalizes to 8h.
 
 const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
 
@@ -11,22 +11,19 @@ const BINANCE_SYMBOLS = {
   BNB: "BNBUSDT",
 };
 
-const VARIATIONAL_BASE =
-  "https://omni-client-api.prod.ap-northeast-1.variational.io";
-
+const VARIATIONAL_BASE = "https://omni-client-api.prod.ap-northeast-1.variational.io";
 const LIGHTER_BASE = "https://mainnet.zklighter.elliot.ai";
-
-// Hyperliquid
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
-
-// 01.xyz
 const O1_BASE = "https://zo-mainnet.n1.xyz";
 
-// Nado (Gateway/Archive endpoints are /v1, per docs)
 const NADO_GATEWAY = "https://gateway.prod.nado.xyz/v1";
 const NADO_ARCHIVE = "https://archive.prod.nado.xyz/v1";
 
-// Plugin exchanges (set these in Vercel env)
+const PACIFICA_BASE = process.env.PACIFICA_BASE_URL || "https://api.pacifica.fi";
+const PARADEX_BASE = process.env.PARADEX_BASE_URL || "https://api.prod.paradex.trade";
+const EXTENDED_BASE = process.env.EXTENDED_BASE_URL || "https://api.extended.exchange";
+
+// Optional plugin env overrides/fallbacks
 // - PACIFICA_FUNDING_URL
 // - PARADEX_FUNDING_URL
 // - EXTENDED_FUNDING_URL
@@ -34,7 +31,7 @@ const NADO_ARCHIVE = "https://archive.prod.nado.xyz/v1";
 const PLUGIN_DEFAULT_INTERVAL_S = {
   pacifica: 3600,
   paradex: 28800,
-  extended: 28800,
+  extended: 3600,
 };
 
 function toNum(x) {
@@ -62,6 +59,47 @@ function normalizeTo8h(rate, intervalS) {
   if (r === null) return null;
   if (!s || s <= 0) return r;
   return r * (28800 / s);
+}
+
+function toIsoMaybe(x) {
+  if (x === null || x === undefined || x === "") return null;
+
+  if (typeof x === "number") {
+    if (!Number.isFinite(x) || x <= 0) return null;
+    // seconds vs milliseconds heuristic
+    const ms = x > 1e12 ? x : x * 1000;
+    return new Date(ms).toISOString();
+  }
+
+  const n = Number(x);
+  if (Number.isFinite(n) && n > 0) {
+    const ms = n > 1e12 ? n : n * 1000;
+    return new Date(ms).toISOString();
+  }
+
+  const d = new Date(String(x));
+  if (!Number.isNaN(d.getTime())) return d.toISOString();
+  return null;
+}
+
+function mergeRowsBySymbol(primary, fallback) {
+  const bySym = new Map();
+  for (const r of fallback || []) bySym.set(`${r.exchange}|${r.symbol}`, r);
+  for (const r of primary || []) bySym.set(`${r.exchange}|${r.symbol}`, r);
+  return Array.from(bySym.values());
+}
+
+function extractBaseSymbol(raw) {
+  const s = String(raw || "").toUpperCase();
+  if (!s) return "";
+  for (const base of TARGETS) {
+    if (s === base) return base;
+    if (s.startsWith(`${base}-`)) return base;
+    if (s.startsWith(`${base}/`)) return base;
+    if (s.startsWith(`${base}_`)) return base;
+    if (s.startsWith(base) && /PERP|USD|USDT/.test(s)) return base;
+  }
+  return "";
 }
 
 async function fetchJson(url, timeoutMs = 8000, options = {}) {
@@ -288,11 +326,7 @@ async function getHyperliquid() {
   return rows;
 }
 
-/** ---------------- 01.xyz ----------------
- * Docs:
- *  - GET /info -> markets[] (market_id, symbol, ...)
- *  - GET /market/{market_id}/stats -> perpStats.funding_rate (hourly), perpStats.next_funding_time (ISO), etc.
- */
+/** ---------------- 01.xyz ---------------- */
 async function get01xyz() {
   let info;
   try {
@@ -308,16 +342,14 @@ async function get01xyz() {
     return [];
   }
 
-  // Build candidate market_ids per symbol (we will probe /stats until we find perpStats)
   const candBySym = new Map();
   for (const m of markets) {
     const mid = toNum(m?.market_id ?? m?.marketId ?? m?.id);
     if (mid === null) continue;
 
-    const sym = String(m?.symbol || "").toUpperCase(); // e.g. BTCUSD
+    const sym = String(m?.symbol || "").toUpperCase();
     for (const base of TARGETS) {
       if (!sym.includes(base)) continue;
-      // prefer "BASEUSD" exact-ish
       const score =
         (sym === `${base}USD` ? 3 :
         (sym.startsWith(base) && sym.endsWith("USD") ? 2 :
@@ -329,7 +361,6 @@ async function get01xyz() {
     }
   }
 
-  // sort candidates by score desc (best first)
   for (const base of TARGETS) {
     const c = candBySym.get(base) || [];
     c.sort((a, b) => (b.score - a.score) || (a.market_id - b.market_id));
@@ -341,7 +372,6 @@ async function get01xyz() {
     const cands = candBySym.get(base) || [];
     if (!cands.length) continue;
 
-    // probe up to 6 candidates until perpStats exists
     let picked = null;
     let st = null;
 
@@ -367,7 +397,6 @@ async function get01xyz() {
 
     const perp = st?.perpStats || st?.perp_stats;
 
-    // docs: perpStats.funding_rate is HOURLY (1h) funding. normalize -> 8h
     const rate1h =
       toNum(perp?.funding_rate) ??
       toNum(perp?.fundingRate) ??
@@ -387,7 +416,6 @@ async function get01xyz() {
       toNum(perp?.markPrice) ??
       null;
 
-    // docs: perpStats.next_funding_time is ISO string
     const nextIso =
       (typeof perp?.next_funding_time === "string" ? perp.next_funding_time : null) ??
       (typeof perp?.nextFundingTime === "string" ? perp.nextFundingTime : null) ??
@@ -398,7 +426,8 @@ async function get01xyz() {
     rows.push({
       exchange: "01xyz",
       symbol: base,
-      funding_rate_raw: rate1h,       // 1h raw
+      funding_rate_raw: rate1h,
+      source_interval_s: 3600,
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
@@ -414,12 +443,14 @@ async function get01xyz() {
 }
 
 /** ---------------- Nado ----------------
- * Gateway: GET /v1/symbols
- * Archive: POST /v1 with body { funding_rates: { product_ids: [...] } }
- * funding_rate_x18 is 24h funding; convert -> 8h by /3
+ * Docs reference:
+ * - https://docs.nado.xyz/funding-rates
+ * - https://docs.nado.xyz/developer-resources/api/subscriptions/events
+ *
+ * funding_rate_x18 is a 24h-equivalent quote (x18), updated frequently and
+ * settled on an hourly cadence. We keep raw as 24h-equivalent and convert to 8h by /3.
  */
 async function getNado() {
-  // 1) symbols
   let symbolsRes;
   try {
     symbolsRes = await fetchJson(`${NADO_GATEWAY}/symbols`, 12000);
@@ -428,11 +459,7 @@ async function getNado() {
     return [];
   }
 
-  // Accept:
-  // A) array: [{product_id, symbol, ...}, ...]
-  // B) { status:"success", data:{ symbols:{ "SOL-PERP": {...}, ... } } }
   let symbolsList = null;
-
   if (Array.isArray(symbolsRes)) {
     symbolsList = symbolsRes;
   } else if (Array.isArray(symbolsRes?.data)) {
@@ -468,7 +495,6 @@ async function getNado() {
     return [];
   }
 
-  // 2) funding rates (archive)
   let fr;
   try {
     fr = await fetchJson(
@@ -487,7 +513,6 @@ async function getNado() {
     return [];
   }
 
-  // Response is typically a map: { "2": { product_id, funding_rate_x18, update_time }, ... }
   const inner =
     fr?.data?.funding_rates ||
     fr?.funding_rates ||
@@ -515,19 +540,18 @@ async function getNado() {
     if (!rec) continue;
 
     const x18 = rec?.funding_rate_x18 ?? rec?.fundingRateX18 ?? null;
-    const r24 = x18 != null ? Number(x18) / 1e18 : null; // 24h funding
-    if (!Number.isFinite(r24)) continue;
+    const r24eq = x18 != null ? Number(x18) / 1e18 : null;
+    if (!Number.isFinite(r24eq)) continue;
 
-    const rate8h = r24 / 3; // 24h -> 8h
-
-    const upd = toNum(rec?.update_time ?? rec?.updateTime);
-    const sourceIso = upd ? new Date(upd * 1000).toISOString() : null;
+    const rate8h = r24eq / 3;
+    const sourceIso = toIsoMaybe(rec?.update_time ?? rec?.updateTime);
 
     rows.push({
       exchange: "nado",
       symbol: base,
-      funding_rate_raw: r24, // 24h raw
-      source_interval_s: 86400,
+      funding_rate_raw: r24eq,
+      source_interval_s: 3600, // settlement/update cadence
+      funding_rate_window_s: 86400, // raw quote window
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
@@ -535,19 +559,14 @@ async function getNado() {
       source_ts: sourceIso,
       nado_product_id: p.product_id,
       nado_symbol: p.symbol_key,
-      nado_source: "gateway:/v1/symbols + archive:/v1 (funding_rates, 24h -> 8h)",
+      nado_source: "gateway:/v1/symbols + archive:/v1 (24h-eq quote -> 8h)",
     });
   }
 
   return rows;
 }
 
-/** ---------------- Plugin Exchanges ----------------
- * Expects endpoint response in one of the shapes:
- *  - [{ symbol, funding_rate_1h|fundingRate1h|funding_rate|fundingRate, mark_price|markPrice, funding_interval_s|interval_s }]
- *  - { rows: [...] }
- *  - { data: [...] }
- */
+/** ---------------- Optional Plugin Exchange ---------------- */
 async function getPluginExchange(exchange, envKey) {
   const url = String(process.env?.[envKey] || "").trim();
   if (!url) return [];
@@ -630,6 +649,175 @@ async function getPluginExchange(exchange, envKey) {
   return rows;
 }
 
+/** ---------------- Pacifica ---------------- */
+async function getPacifica() {
+  const fallback = await getPluginExchange("pacifica", "PACIFICA_FUNDING_URL");
+
+  let j;
+  try {
+    j = await fetchJson(`${PACIFICA_BASE}/api/v1/info/prices`, 12000, {
+      headers: { Accept: "application/json" },
+    });
+  } catch (e) {
+    console.log("[pacifica] /api/v1/info/prices failed:", String(e?.message || e));
+    return fallback;
+  }
+
+  const items =
+    Array.isArray(j) ? j :
+    Array.isArray(j?.data) ? j.data :
+    Array.isArray(j?.rows) ? j.rows :
+    [];
+
+  if (!items.length) return fallback;
+
+  const bySym = new Map();
+  for (const it of items) {
+    const sym = extractBaseSymbol(it?.symbol);
+    if (!TARGETS.includes(sym)) continue;
+    bySym.set(sym, it);
+  }
+
+  const rows = [];
+  for (const sym of TARGETS) {
+    const it = bySym.get(sym);
+    if (!it) continue;
+
+    const rate1h =
+      toNum(it?.funding) ??
+      toNum(it?.funding_rate) ??
+      toNum(it?.next_funding) ??
+      toNum(it?.next_funding_rate) ??
+      null;
+    if (rate1h == null) continue;
+
+    const mark = toNum(it?.mark) ?? toNum(it?.mark_price) ?? null;
+    const rate8h = normalizeTo8h(rate1h, 3600);
+
+    rows.push({
+      exchange: "pacifica",
+      symbol: sym,
+      funding_rate_raw: rate1h,
+      source_interval_s: 3600,
+      funding_interval_s: 28800,
+      funding_rate_next_interval: rate8h,
+      funding_rate_8h: rate8h,
+      mark_price: mark,
+      source_ts: toIsoMaybe(it?.timestamp),
+      pacifica_source: "/api/v1/info/prices (hourly funding)",
+    });
+  }
+
+  return mergeRowsBySymbol(rows, fallback);
+}
+
+/** ---------------- Paradex ---------------- */
+async function getParadex() {
+  const fallback = await getPluginExchange("paradex", "PARADEX_FUNDING_URL");
+
+  let j;
+  try {
+    j = await fetchJson(`${PARADEX_BASE}/v1/markets/summary?market=ALL`, 12000, {
+      headers: { Accept: "application/json" },
+    });
+  } catch (e) {
+    console.log("[paradex] /v1/markets/summary failed:", String(e?.message || e));
+    return fallback;
+  }
+
+  const items =
+    Array.isArray(j?.results) ? j.results :
+    Array.isArray(j) ? j :
+    [];
+
+  if (!items.length) return fallback;
+
+  const rows = [];
+  for (const sym of TARGETS) {
+    const exact = items.find((it) => String(it?.symbol || "").toUpperCase() === `${sym}-USD-PERP`);
+    const broad = exact || items.find((it) => {
+      const m = String(it?.symbol || "").toUpperCase();
+      return m.startsWith(`${sym}-`) && m.includes("PERP");
+    });
+    if (!broad) continue;
+
+    const rate = toNum(broad?.funding_rate ?? broad?.future_funding_rate);
+    if (rate == null) continue;
+
+    rows.push({
+      exchange: "paradex",
+      symbol: sym,
+      funding_rate_raw: rate,
+      source_interval_s: 28800,
+      funding_interval_s: 28800,
+      funding_rate_next_interval: rate,
+      funding_rate_8h: rate,
+      mark_price: toNum(broad?.mark_price),
+      source_ts: toIsoMaybe(broad?.created_at),
+      paradex_market: broad?.symbol || null,
+      paradex_source: "/v1/markets/summary",
+    });
+  }
+
+  return mergeRowsBySymbol(rows, fallback);
+}
+
+/** ---------------- Extended ---------------- */
+async function getExtended() {
+  const fallback = await getPluginExchange("extended", "EXTENDED_FUNDING_URL");
+
+  let j;
+  try {
+    j = await fetchJson(`${EXTENDED_BASE}/api/v1/info/markets`, 12000, {
+      headers: { Accept: "application/json" },
+    });
+  } catch (e) {
+    console.log("[extended] /api/v1/info/markets failed:", String(e?.message || e));
+    return fallback;
+  }
+
+  const items =
+    Array.isArray(j?.data) ? j.data :
+    Array.isArray(j) ? j :
+    [];
+
+  if (!items.length) return fallback;
+
+  const bySym = new Map();
+  for (const it of items) {
+    const base = String(it?.assetName || "").toUpperCase() || extractBaseSymbol(it?.name);
+    if (!TARGETS.includes(base)) continue;
+    bySym.set(base, it);
+  }
+
+  const rows = [];
+  for (const sym of TARGETS) {
+    const it = bySym.get(sym);
+    if (!it) continue;
+
+    const stats = it?.marketStats || {};
+    const rate1h = toNum(stats?.fundingRate ?? stats?.funding_rate);
+    if (rate1h == null) continue;
+
+    const rate8h = normalizeTo8h(rate1h, 3600);
+    rows.push({
+      exchange: "extended",
+      symbol: sym,
+      funding_rate_raw: rate1h,
+      source_interval_s: 3600,
+      funding_interval_s: 28800,
+      funding_rate_next_interval: rate8h,
+      funding_rate_8h: rate8h,
+      mark_price: toNum(stats?.markPrice ?? stats?.mark_price),
+      source_ts: toIsoMaybe(stats?.nextFundingRate ?? stats?.next_funding_rate),
+      extended_market: it?.name || null,
+      extended_source: "/api/v1/info/markets (marketStats)",
+    });
+  }
+
+  return mergeRowsBySymbol(rows, fallback);
+}
+
 function fillMissingMarks(rows) {
   const markBySymbol = new Map();
 
@@ -675,9 +863,9 @@ export default async function handler(req, res) {
       getHyperliquid(),
       get01xyz(),
       getNado(),
-      getPluginExchange("pacifica", "PACIFICA_FUNDING_URL"),
-      getPluginExchange("paradex", "PARADEX_FUNDING_URL"),
-      getPluginExchange("extended", "EXTENDED_FUNDING_URL"),
+      getPacifica(),
+      getParadex(),
+      getExtended(),
     ]);
 
     const rows = [...v, ...b, ...l, ...h, ...o1, ...nado, ...pacifica, ...paradex, ...extended];
