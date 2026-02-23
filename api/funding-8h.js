@@ -26,6 +26,17 @@ const O1_BASE = "https://zo-mainnet.n1.xyz";
 const NADO_GATEWAY = "https://gateway.prod.nado.xyz/v1";
 const NADO_ARCHIVE = "https://archive.prod.nado.xyz/v1";
 
+// Plugin exchanges (set these in Vercel env)
+// - PACIFICA_FUNDING_URL
+// - PARADEX_FUNDING_URL
+// - EXTENDED_FUNDING_URL
+
+const PLUGIN_DEFAULT_INTERVAL_S = {
+  pacifica: 3600,
+  paradex: 28800,
+  extended: 28800,
+};
+
 function toNum(x) {
   if (x === null || x === undefined) return null;
   const n = Number(x);
@@ -89,6 +100,7 @@ async function getVariational() {
       exchange: "variational",
       symbol: sym,
       funding_rate_raw: rateAnnual,
+      source_interval_s: 28800,
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
@@ -119,6 +131,7 @@ async function getBinance() {
       exchange: "binance",
       symbol: sym,
       funding_rate_raw: nextFundingRate8h,
+      source_interval_s: 28800,
       funding_interval_s: 28800,
       funding_rate_next_interval: nextFundingRate8h,
       funding_rate_8h: nextFundingRate8h,
@@ -178,6 +191,7 @@ async function getLighter() {
       exchange: "lighter",
       symbol: sym,
       funding_rate_raw: rateRaw,
+      source_interval_s: interval,
       funding_interval_s: 28800,
       funding_rate_next_interval: rateRaw,
       funding_rate_8h: normalizeTo8h(rateRaw, interval),
@@ -261,6 +275,7 @@ async function getHyperliquid() {
       exchange: "hyperliquid",
       symbol: sym,
       funding_rate_raw: rate1h,
+      source_interval_s: 3600,
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
@@ -512,6 +527,7 @@ async function getNado() {
       exchange: "nado",
       symbol: base,
       funding_rate_raw: r24, // 24h raw
+      source_interval_s: 86400,
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
@@ -520,6 +536,94 @@ async function getNado() {
       nado_product_id: p.product_id,
       nado_symbol: p.symbol_key,
       nado_source: "gateway:/v1/symbols + archive:/v1 (funding_rates, 24h -> 8h)",
+    });
+  }
+
+  return rows;
+}
+
+/** ---------------- Plugin Exchanges ----------------
+ * Expects endpoint response in one of the shapes:
+ *  - [{ symbol, funding_rate_1h|fundingRate1h|funding_rate|fundingRate, mark_price|markPrice, funding_interval_s|interval_s }]
+ *  - { rows: [...] }
+ *  - { data: [...] }
+ */
+async function getPluginExchange(exchange, envKey) {
+  const url = String(process.env?.[envKey] || "").trim();
+  if (!url) return [];
+
+  let j;
+  try {
+    j = await fetchJson(url, 12000);
+  } catch (e) {
+    console.log(`[${exchange}] plugin fetch failed:`, String(e?.message || e));
+    return [];
+  }
+
+  const items =
+    Array.isArray(j) ? j :
+    Array.isArray(j?.rows) ? j.rows :
+    Array.isArray(j?.data) ? j.data :
+    [];
+
+  if (!items.length) return [];
+
+  const bySym = new Map();
+  for (const it of items) {
+    const sym = String(it?.symbol || it?.raw_symbol || it?.ticker || "").toUpperCase().trim();
+    if (!TARGETS.includes(sym)) continue;
+    bySym.set(sym, it);
+  }
+
+  const rows = [];
+  for (const sym of TARGETS) {
+    const it = bySym.get(sym);
+    if (!it) continue;
+
+    const rateRaw =
+      toNum(it?.funding_rate_1h) ??
+      toNum(it?.fundingRate1h) ??
+      toNum(it?.funding_rate) ??
+      toNum(it?.fundingRate) ??
+      toNum(it?.funding_rate_8h) ??
+      toNum(it?.fundingRate8h) ??
+      null;
+    if (rateRaw == null) continue;
+
+    const intervalS =
+      toNum(it?.source_interval_s) ??
+      toNum(it?.funding_source_interval_s) ??
+      toNum(it?.funding_interval_source_s) ??
+      toNum(it?.interval_source_s) ??
+      toNum(it?.funding_interval_s) ??
+      toNum(it?.fundingIntervalS) ??
+      toNum(it?.interval_s) ??
+      toNum(it?.intervalS) ??
+      (PLUGIN_DEFAULT_INTERVAL_S[String(exchange || "").toLowerCase()] || 3600);
+
+    const rate8h = normalizeTo8h(rateRaw, intervalS);
+    const mark =
+      toNum(it?.mark_price) ??
+      toNum(it?.markPrice) ??
+      toNum(it?.mark) ??
+      null;
+
+    rows.push({
+      exchange,
+      symbol: sym,
+      funding_rate_raw: rateRaw,
+      source_interval_s: intervalS,
+      funding_interval_s: 28800,
+      funding_rate_next_interval: rate8h,
+      funding_rate_8h: rate8h,
+      mark_price: mark,
+      source_ts:
+        it?.source_ts ??
+        it?.timestamp ??
+        it?.updated_at ??
+        it?.updatedAt ??
+        null,
+      plugin_source: envKey,
     });
   }
 
@@ -564,16 +668,19 @@ export default async function handler(req, res) {
   try {
     const asOf = new Date().toISOString();
 
-    const [v, b, l, h, o1, nado] = await Promise.all([
+    const [v, b, l, h, o1, nado, pacifica, paradex, extended] = await Promise.all([
       getVariational(),
       getBinance(),
       getLighter(),
       getHyperliquid(),
       get01xyz(),
       getNado(),
+      getPluginExchange("pacifica", "PACIFICA_FUNDING_URL"),
+      getPluginExchange("paradex", "PARADEX_FUNDING_URL"),
+      getPluginExchange("extended", "EXTENDED_FUNDING_URL"),
     ]);
 
-    const rows = [...v, ...b, ...l, ...h, ...o1, ...nado];
+    const rows = [...v, ...b, ...l, ...h, ...o1, ...nado, ...pacifica, ...paradex, ...extended];
     fillMissingMarks(rows);
 
     const exOrder = {
@@ -583,6 +690,9 @@ export default async function handler(req, res) {
       hyperliquid: 3,
       "01xyz": 4,
       nado: 5,
+      pacifica: 6,
+      paradex: 7,
+      extended: 8,
     };
 
     rows.sort((a, b) => {
