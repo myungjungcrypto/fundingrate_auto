@@ -766,40 +766,51 @@ async function getParadex() {
 async function getExtended() {
   const fallback = await getPluginExchange("extended", "EXTENDED_FUNDING_URL");
 
-  let j;
-  try {
-    j = await fetchJson(`${EXTENDED_BASE}/api/v1/info/markets`, 12000, {
-      headers: { Accept: "application/json" },
-    });
-  } catch (e) {
-    console.log("[extended] /api/v1/info/markets failed:", String(e?.message || e));
-    return fallback;
-  }
-
-  const items =
-    Array.isArray(j?.data) ? j.data :
-    Array.isArray(j) ? j :
-    [];
-
-  if (!items.length) return fallback;
-
-  const bySym = new Map();
-  for (const it of items) {
-    const base = String(it?.assetName || "").toUpperCase() || extractBaseSymbol(it?.name);
-    if (!TARGETS.includes(base)) continue;
-    bySym.set(base, it);
-  }
-
   const rows = [];
   for (const sym of TARGETS) {
-    const it = bySym.get(sym);
-    if (!it) continue;
+    const marketCandidates = [`${sym}-USD`, `${sym}-USD-PERP`, `${sym}-PERP`];
 
-    const stats = it?.marketStats || {};
-    const rate1h = toNum(stats?.fundingRate ?? stats?.funding_rate);
+    let pickedMarket = null;
+    let statsResp = null;
+
+    for (const market of marketCandidates) {
+      try {
+        statsResp = await fetchJson(
+          `${EXTENDED_BASE}/api/v1/info/markets/${encodeURIComponent(market)}/stats`,
+          12000,
+          { headers: { Accept: "application/json" } }
+        );
+        pickedMarket = market;
+        break;
+      } catch (e) {
+        // try next candidate
+      }
+    }
+
+    if (!statsResp) continue;
+
+    const payload = statsResp?.data ?? statsResp?.marketStats ?? statsResp;
+
+    const rate1h =
+      toNum(payload?.fundingRate) ??
+      toNum(payload?.funding_rate) ??
+      toNum(payload?.nextFundingRate) ??
+      toNum(payload?.next_funding_rate) ??
+      null;
+
     if (rate1h == null) continue;
 
+    const mark =
+      toNum(payload?.markPrice) ??
+      toNum(payload?.mark_price) ??
+      toNum(payload?.oraclePrice) ??
+      toNum(payload?.oracle_price) ??
+      toNum(payload?.indexPrice) ??
+      toNum(payload?.index_price) ??
+      null;
+
     const rate8h = normalizeTo8h(rate1h, 3600);
+
     rows.push({
       exchange: "extended",
       symbol: sym,
@@ -808,11 +819,21 @@ async function getExtended() {
       funding_interval_s: 28800,
       funding_rate_next_interval: rate8h,
       funding_rate_8h: rate8h,
-      mark_price: toNum(stats?.markPrice ?? stats?.mark_price),
-      source_ts: toIsoMaybe(stats?.nextFundingRate ?? stats?.next_funding_rate),
-      extended_market: it?.name || null,
-      extended_source: "/api/v1/info/markets (marketStats)",
+      mark_price: mark,
+      source_ts: toIsoMaybe(
+        payload?.timestamp ??
+        payload?.updated_at ??
+        payload?.updatedAt ??
+        payload?.nextFundingAt ??
+        payload?.next_funding_at
+      ),
+      extended_market: pickedMarket,
+      extended_source: "/api/v1/info/markets/{market}/stats",
     });
+  }
+
+  if (!rows.length) {
+    console.log("[extended] no rows from /api/v1/info/markets/{market}/stats for target symbols");
   }
 
   return mergeRowsBySymbol(rows, fallback);
