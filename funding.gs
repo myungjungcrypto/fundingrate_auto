@@ -67,8 +67,8 @@ const FUNDING_SCHEDULE_HOURS_KST = [0, 8, 16];
 const FUNDING_SCHEDULE_MINUTE = 59;
 
 // ✅ 버킷 허용 범위: (HH:59 기준) 55~(다음 시각)05
-const SLOT_TOL_BEFORE_MIN = 53;
-const SLOT_TOL_AFTER_MIN = 5;
+const SLOT_TOL_BEFORE_MIN = 50;
+const SLOT_TOL_AFTER_MIN = 8;
 
 // symbols
 const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
@@ -249,7 +249,7 @@ function funding_addMenu_() {
       .addSeparator()
       .addItem("Optimize allocation (maximize funding)", "funding_optimizeAllocation")
       .addSeparator()
-      .addItem("Install 8h schedule (00:59/08:59/16:59 KST)", "funding_install3xDailyTriggers")
+      .addItem("Install 8h schedule + retry (00:59/08:59/16:59 KST)", "funding_install3xDailyTriggers")
       .addItem("Install hourly schedule (1h-cadence, every hour ~:59 KST)", "funding_installLighterHourlyTrigger")
       .addSeparator()
       .addItem("Bootstrap hourly history NOW (1 shot)", "funding_bootstrapLighterHourlySheetNow")
@@ -408,7 +408,13 @@ function funding_install3xDailyTriggers() {
       .create();
   }
 
-  safeAlert_("✅ 8h 트리거 설치 완료 (00:59/08:59/16:59)");
+  // Reliability retry: run every 10 minutes, guard logic records only 8h slots.
+  ScriptApp.newTrigger("funding_recordHistorySnapshot")
+    .timeBased()
+    .everyMinutes(10)
+    .create();
+
+  safeAlert_("✅ 8h 트리거 설치 완료 (daily 3 + retry every 10m)");
 }
 
 function funding_installLighterHourlyTrigger() {
