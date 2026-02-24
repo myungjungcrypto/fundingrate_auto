@@ -242,6 +242,7 @@ function funding_addMenu_() {
       .addSeparator()
       .addItem("Update current now (no history)", "funding_updateCurrentNow")
       .addItem("Update positions PnL", "funding_updatePositionsPnl")
+      .addItem("Seed positions rows (all exchanges)", "funding_seedPositionsTemplateRowsNow")
       .addItem("Update rolling funding PnL (3/7/15d)", "funding_updatePositionsRollingFundingPnl_3_7_15_30_all") // ✅ rolling pnl
       .addItem("Update OPT rolling funding PnL (3/7/15/30/all)", "funding_updateOptSolutionRollingFundingPnl_3_7_15_30_all")
       .addItem("Update current + positions", "funding_updateCurrentAndPositionsNow")
@@ -287,7 +288,7 @@ function funding_initSheets() {
   ]);
 
   // ✅ positions: rolling은 pnl만 (cost 컬럼 없음)
-  funding_initSheet_(ss, FUNDING_SHEET_POSITIONS, [
+  const shPos = funding_initSheet_(ss, FUNDING_SHEET_POSITIONS, [
     "exchange",
     "symbol",
     "qty",
@@ -351,7 +352,16 @@ function funding_initSheets() {
       .setValues([[FUNDING_HOURLY_EXCHANGES_CONFIG_KEY, FUNDING_DEFAULT_HOURLY_EXCHANGES.join(",")]]);
   }
 
-  safeAlert_("✅ funding_initSheets 완료");
+  const seeded = funding_ensurePositionTemplateRows_(
+    shPos,
+    funding_getPositionTemplateExchanges_(),
+    TARGETS
+  );
+
+  safeAlert_(
+    "✅ funding_initSheets 완료\n" +
+    `- positions template rows appended: ${seeded.appended} (total template ${seeded.templateTotal})`
+  );
 }
 
 /**
@@ -815,6 +825,83 @@ function funding_isHourlyCadenceRow_(row, hourlyExSet) {
 function funding_pickHourlyRows_(rows, shConfig) {
   const hourlyExSet = funding_getHourlyExchangeSet_(shConfig);
   return (rows || []).filter((r) => funding_isHourlyCadenceRow_(r, hourlyExSet));
+}
+
+function funding_getPositionTemplateExchanges_() {
+  return Object.entries(EX_ORDER)
+    .sort((a, b) => Number(a[1]) - Number(b[1]))
+    .map(([ex]) => String(ex || "").toLowerCase());
+}
+
+function funding_ensurePositionTemplateRows_(shPos, exchanges, symbols) {
+  if (!shPos) throw new Error("positions 시트를 찾을 수 없어.");
+
+  const lastCol = Math.max(1, shPos.getLastColumn());
+  const header = shPos.getRange(1, 1, 1, lastCol).getValues()[0].map((v) => String(v || "").trim());
+
+  const iEx = header.indexOf("exchange");
+  const iSym = header.indexOf("symbol");
+  const iQty = header.indexOf("qty");
+  if (iEx < 0 || iSym < 0) {
+    throw new Error("positions 헤더에 exchange/symbol가 필요해.");
+  }
+
+  const existing = new Set();
+  const lastRow = shPos.getLastRow();
+  if (lastRow >= 2) {
+    const vals = shPos.getRange(2, 1, lastRow - 1, lastCol).getValues();
+    for (const row of vals) {
+      const ex = String(row[iEx] || "").trim().toLowerCase();
+      const sym = String(row[iSym] || "").trim().toUpperCase();
+      if (!ex || !sym) continue;
+      existing.add(`${ex}|${sym}`);
+    }
+  }
+
+  const exList = (exchanges || []).map((ex) => String(ex || "").trim().toLowerCase()).filter(Boolean);
+  const symList = (symbols || []).map((sym) => String(sym || "").trim().toUpperCase()).filter(Boolean);
+
+  const out = [];
+  for (const ex of exList) {
+    for (const sym of symList) {
+      const key = `${ex}|${sym}`;
+      if (existing.has(key)) continue;
+
+      const row = Array(lastCol).fill("");
+      row[iEx] = ex;
+      row[iSym] = sym;
+      if (iQty >= 0) row[iQty] = 0;
+      out.push(row);
+      existing.add(key);
+    }
+  }
+
+  if (out.length) {
+    shPos.getRange(shPos.getLastRow() + 1, 1, out.length, lastCol).setValues(out);
+  }
+
+  return {
+    appended: out.length,
+    templateTotal: exList.length * symList.length,
+  };
+}
+
+function funding_seedPositionsTemplateRowsNow() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shPos = ss.getSheetByName(FUNDING_SHEET_POSITIONS);
+  if (!shPos) throw new Error("positions 시트를 찾을 수 없어. Init sheets 먼저 실행해줘.");
+
+  const seeded = funding_ensurePositionTemplateRows_(
+    shPos,
+    funding_getPositionTemplateExchanges_(),
+    TARGETS
+  );
+
+  safeAlert_(
+    "✅ positions template rows 반영 완료\n" +
+    `- appended: ${seeded.appended}\n` +
+    `- template total: ${seeded.templateTotal}`
+  );
 }
 
 function funding_getScriptProps_() {
