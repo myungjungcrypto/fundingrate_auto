@@ -2136,6 +2136,12 @@ const OPT_DEFAULT_INPUTS = [
 
   ["use_live_slippage_api", "TRUE"],
   ["slippage_api_url", OPT_DEFAULT_SLIPPAGE_API_URL],
+  // Symbol-specific reference size for live slippage lookup (base-asset qty).
+  // If <= 0, fallback to actual rebalance qty for that symbol.
+  ["live_slippage_qty_btc", 0],
+  ["live_slippage_qty_eth", 0],
+  ["live_slippage_qty_sol", 0],
+  ["live_slippage_qty_bnb", 0],
 
   ["binance_gross_max_mult", 5.0],
   ["lighter_gross_max_mult", 5.0],
@@ -2173,6 +2179,19 @@ function funding_getFeeBpsInputKey_(ex) {
 
 function funding_getSlippageBpsInputKey_(ex) {
   return `${ex}_slippage_bps`;
+}
+
+function funding_getLiveSlippageQtyInputKey_(sym) {
+  return `live_slippage_qty_${String(sym || "").toLowerCase()}`;
+}
+
+function funding_getLiveSlippageQtyBySymbol_(inputs) {
+  const out = {};
+  for (const sym of OPT_SYMBOLS) {
+    const raw = Number(inputs[funding_getLiveSlippageQtyInputKey_(sym)]);
+    out[sym] = Number.isFinite(raw) && raw > 0 ? raw : 0;
+  }
+  return out;
 }
 
 function funding_getGrossMaxMultByExchange_(inputs) {
@@ -2218,9 +2237,9 @@ function funding_buildSlippageApiEndpoint_(rawUrl) {
   return base.replace(/\/+$/, "") + "/api/slippage";
 }
 
-function funding_fetchLiveSlippageMap_(apiEndpoint, coin, qtyAbs, side) {
+function funding_buildLiveSlippageUrl_(apiEndpoint, coin, qtyAbs, side) {
   const qty = Number(qtyAbs);
-  if (!apiEndpoint || !coin || !(qty > 0)) return new Map();
+  if (!apiEndpoint || !coin || !(qty > 0)) return "";
 
   const qs =
     "coin=" + encodeURIComponent(String(coin).toUpperCase()) +
@@ -2228,19 +2247,13 @@ function funding_fetchLiveSlippageMap_(apiEndpoint, coin, qtyAbs, side) {
     "&side=" + encodeURIComponent(String(side || "buy").toLowerCase());
 
   const sep = apiEndpoint.indexOf("?") >= 0 ? "&" : "?";
-  const url = apiEndpoint + sep + qs;
+  return apiEndpoint + sep + qs;
+}
 
-  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-  const code = resp.getResponseCode();
-  const text = resp.getContentText();
-  if (code < 200 || code >= 300) {
-    throw new Error(`slippage API HTTP ${code}: ${text}`);
-  }
-
-  const payload = JSON.parse(text);
-  const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+function funding_parseLiveSlippageRowsToMap_(rows) {
   const out = new Map();
-  for (const r of rows) {
+  const arr = Array.isArray(rows) ? rows : [];
+  for (const r of arr) {
     const status = String(r?.status || "").toLowerCase();
     if (status && status !== "ok") continue;
 
@@ -2257,6 +2270,62 @@ function funding_fetchLiveSlippageMap_(apiEndpoint, coin, qtyAbs, side) {
     });
   }
   return out;
+}
+
+function funding_fetchLiveSlippageMap_(apiEndpoint, coin, qtyAbs, side) {
+  const url = funding_buildLiveSlippageUrl_(apiEndpoint, coin, qtyAbs, side);
+  if (!url) return new Map();
+
+  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  const code = resp.getResponseCode();
+  const text = resp.getContentText();
+  if (code < 200 || code >= 300) {
+    throw new Error(`slippage API HTTP ${code}: ${text}`);
+  }
+
+  const payload = JSON.parse(text);
+  return funding_parseLiveSlippageRowsToMap_(payload?.rows);
+}
+
+function funding_fetchLiveSlippageMapsBatch_(apiEndpoint, reqs) {
+  const requests = Array.isArray(reqs) ? reqs : [];
+  const byKey = new Map();
+  const errors = [];
+  if (!apiEndpoint || !requests.length) return { byKey, errors };
+
+  const jobs = [];
+  for (const r of requests) {
+    const key = String(r?.key || "");
+    const coin = String(r?.coin || "").toUpperCase();
+    const qty = Number(r?.qty);
+    const side = String(r?.side || "buy").toLowerCase();
+    if (!key || !coin || !(qty > 0)) continue;
+    const url = funding_buildLiveSlippageUrl_(apiEndpoint, coin, qty, side);
+    if (!url) continue;
+    jobs.push({ key, url });
+  }
+
+  if (!jobs.length) return { byKey, errors };
+
+  const responses = UrlFetchApp.fetchAll(jobs.map((j) => ({ url: j.url, muteHttpExceptions: true })));
+  for (let i = 0; i < jobs.length; i++) {
+    const job = jobs[i];
+    const resp = responses[i];
+    try {
+      const code = resp.getResponseCode();
+      const text = resp.getContentText();
+      if (code < 200 || code >= 300) {
+        throw new Error(`slippage API HTTP ${code}: ${text}`);
+      }
+      const payload = JSON.parse(text);
+      const liveMap = funding_parseLiveSlippageRowsToMap_(payload?.rows);
+      byKey.set(job.key, liveMap);
+    } catch (e) {
+      byKey.set(job.key, new Map());
+      errors.push(`${job.key}: ${String(e && e.message ? e.message : e)}`);
+    }
+  }
+  return { byKey, errors };
 }
 
 function funding_initOptimizerSheets() {
@@ -2555,7 +2624,7 @@ function funding_estimateRebalanceTradingCost_(opts) {
       ? true
       : funding_isTrueLike_(useLiveRaw);
   const slippageApiEndpoint = funding_buildSlippageApiEndpoint_(inputs["slippage_api_url"]);
-  const liveSlippageCache = new Map(); // key: SYMBOL|qty|side -> Map(exchange -> {feeBps, slippageBps, source})
+  const liveSlipQtyBySym = funding_getLiveSlippageQtyBySymbol_(inputs);
   const liveSlippageErrors = [];
 
   // keep mark info fresh when available
@@ -2573,6 +2642,7 @@ function funding_estimateRebalanceTradingCost_(opts) {
   const symbolOrder = {};
   for (let i = 0; i < OPT_SYMBOLS.length; i++) symbolOrder[OPT_SYMBOLS[i]] = i;
 
+  const staged = [];
   const rows = [];
   const byEx = new Map();
   let totalTurnover = 0;
@@ -2580,6 +2650,7 @@ function funding_estimateRebalanceTradingCost_(opts) {
   let totalSlip = 0;
   let totalCost = 0;
   const missingMarks = [];
+  let liveSlippageByKey = new Map();
 
   for (const key of keys) {
     const parts = String(key).split("|");
@@ -2613,28 +2684,77 @@ function funding_estimateRebalanceTradingCost_(opts) {
 
     const turnoverUsd = Math.abs(deltaQty) * mark;
     const side = deltaQty > 0 ? "buy" : "sell";
+    staged.push({
+      ex,
+      sym,
+      currentQty,
+      targetQty,
+      deltaQty,
+      mark,
+      turnoverUsd,
+      side,
+    });
+  }
+
+  if (missingMarks.length) {
+    const sample = missingMarks.slice(0, 8).join(", ");
+    throw new Error(`리밸런싱 mark_price 누락: ${sample}${missingMarks.length > 8 ? " ..." : ""}`);
+  }
+
+  if (useLiveSlippage && slippageApiEndpoint && staged.length) {
+    const reqByKey = new Map();
+    for (const t of staged) {
+      const qtyAbs = Math.abs(Number(t.deltaQty) || 0);
+      if (!(qtyAbs > 0)) continue;
+      const refQty = Number(liveSlipQtyBySym[t.sym] || 0);
+      const queryQty = refQty > 0 ? refQty : qtyAbs;
+      const liveKey = `${t.sym}|${funding_round_(queryQty)}|${t.side}`;
+      if (!reqByKey.has(liveKey)) {
+        reqByKey.set(liveKey, {
+          key: liveKey,
+          coin: t.sym,
+          qty: queryQty,
+          side: t.side,
+        });
+      }
+    }
+    try {
+      const batch = funding_fetchLiveSlippageMapsBatch_(slippageApiEndpoint, Array.from(reqByKey.values()));
+      liveSlippageByKey = batch.byKey || new Map();
+      if (Array.isArray(batch.errors) && batch.errors.length) {
+        for (const err of batch.errors) liveSlippageErrors.push(err);
+      }
+    } catch (e) {
+      liveSlippageByKey = new Map();
+      liveSlippageErrors.push(`batch: ${String(e && e.message ? e.message : e)}`);
+    }
+  }
+
+  for (const t of staged) {
+    const ex = t.ex;
+    const sym = t.sym;
+    const currentQty = t.currentQty;
+    const targetQty = t.targetQty;
+    const deltaQty = t.deltaQty;
+    const mark = t.mark;
+    const turnoverUsd = t.turnoverUsd;
+    const side = t.side;
 
     let feeBps = Number(bps.feeBps[ex] || 0);
     let slipBps = Number(bps.slippageBps[ex] || 0);
     let bpsSource = "manual";
 
     if (useLiveSlippage && slippageApiEndpoint) {
-      const liveKey = `${sym}|${funding_round_(Math.abs(deltaQty))}|${side}`;
-      let liveMap = liveSlippageCache.get(liveKey);
-      if (!liveMap) {
-        try {
-          liveMap = funding_fetchLiveSlippageMap_(slippageApiEndpoint, sym, Math.abs(deltaQty), side);
-        } catch (e) {
-          liveMap = new Map();
-          liveSlippageErrors.push(`${liveKey}: ${String(e && e.message ? e.message : e)}`);
-        }
-        liveSlippageCache.set(liveKey, liveMap);
-      }
+      const qtyAbs = Math.abs(Number(deltaQty) || 0);
+      const refQty = Number(liveSlipQtyBySym[sym] || 0);
+      const queryQty = refQty > 0 ? refQty : qtyAbs;
+      const liveKey = `${sym}|${funding_round_(queryQty)}|${side}`;
+      const liveMap = liveSlippageByKey.get(liveKey) || new Map();
       const live = liveMap.get(ex);
       if (live) {
         feeBps = Number(live.feeBps || 0);
         slipBps = Number(live.slippageBps || 0);
-        bpsSource = "live";
+        bpsSource = refQty > 0 ? "live_ref_qty" : "live";
       } else {
         bpsSource = "manual_fallback";
       }
@@ -2674,11 +2794,6 @@ function funding_estimateRebalanceTradingCost_(opts) {
     ]);
   }
 
-  if (missingMarks.length) {
-    const sample = missingMarks.slice(0, 8).join(", ");
-    throw new Error(`리밸런싱 mark_price 누락: ${sample}${missingMarks.length > 8 ? " ..." : ""}`);
-  }
-
   rows.sort((a, b) => {
     const exA = EX_ORDER[String(a[0] || "").toLowerCase()] ?? 999;
     const exB = EX_ORDER[String(b[0] || "").toLowerCase()] ?? 999;
@@ -2699,7 +2814,7 @@ function funding_estimateRebalanceTradingCost_(opts) {
   }
 
   if (showAlert) {
-    const liveQueryCount = useLiveSlippage ? liveSlippageCache.size : 0;
+    const liveQueryCount = useLiveSlippage ? liveSlippageByKey.size : 0;
     const liveErrCount = liveSlippageErrors.length;
     safeAlert_(
       "✅ Rebalance 거래비용 추정 완료\n" +
