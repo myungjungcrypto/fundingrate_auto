@@ -248,6 +248,7 @@ function funding_addMenu_() {
       .addItem("Update current + positions", "funding_updateCurrentAndPositionsNow")
       .addSeparator()
       .addItem("Optimize allocation (maximize funding)", "funding_optimizeAllocation")
+      .addItem("Estimate rebalance cost (positions -> opt)", "funding_estimateRebalanceTradingCostNow")
       .addSeparator()
       .addItem("Install 8h schedule + retry (00:59/08:59/16:59 KST)", "funding_install3xDailyTriggers")
       .addItem("Install hourly schedule (1h-cadence, every hour ~:59 KST)", "funding_installLighterHourlyTrigger")
@@ -1440,7 +1441,12 @@ function funding_updatePositionsPnl() {
     }
   }
 
-  shPos.getRange(2, 1, posVals.length, posVals[0].length).setValues(posVals);
+  // Write only computed columns so qty/exchange/symbol (and any qty formulas) are never overwritten.
+  const writeCols = [cMark, cRate, cInterval, cPnl8h, cPnlDay].filter((c) => c >= 0);
+  for (const c of writeCols) {
+    const colVals = posVals.map((row) => [row[c]]);
+    shPos.getRange(2, c + 1, posVals.length, 1).setValues(colVals);
+  }
 
   funding_writePositionsSummary_(shPos, currentAsOf, total8h, totalDay, byEx);
 
@@ -1737,7 +1743,18 @@ function funding_updatePositionsRollingFundingPnl_3_7_15_30_all() {
     acc.p3 += pnl3; acc.p7 += pnl7; acc.p15 += pnl15; acc.p30 += pnl30; acc.pAll += pnlAll;
   }
 
-  rng.setValues(rows);
+  // Write only rolling output columns; do not rewrite qty/base columns.
+  const rollWriteCols = [
+    iAvg3, iCnt3, iCov3, iSrc3, iPnl3,
+    iAvg7, iCnt7, iCov7, iSrc7, iPnl7,
+    iAvg15, iCnt15, iCov15, iSrc15, iPnl15,
+    iAvg30, iCnt30, iCov30, iSrc30, iPnl30,
+    iAvgAll, iCntAll, iCovAll, iSrcAll, iPnlAll,
+  ].filter((c) => c >= 0);
+  for (const c of rollWriteCols) {
+    const colVals = rows.map((row) => [row[c]]);
+    shPos.getRange(2, c + 1, numRows, 1).setValues(colVals);
+  }
 
   // ✅ rolling 요약은 positions 기본 요약(J열)과 충돌 방지 위해 P열부터 씀
   funding_writeRollingPnlSummary_(shPos, total3, total7, total15, total30, totalAll, byEx);
@@ -2056,6 +2073,8 @@ const OPT_SHEET_INPUTS = "opt_inputs";
 const OPT_SHEET_TARGETS = "opt_targets";
 const OPT_SHEET_RATES = "opt_rates";
 const OPT_SHEET_SOLUTION = "opt_solution";
+const OPT_SHEET_REBALANCE_COST = "opt_rebalance_cost";
+const OPT_DEFAULT_SLIPPAGE_API_URL = "https://slippage.vercel.app/api/slippage";
 
 // Exchanges / symbols
 const OPT_EXCHANGES = [
@@ -2095,10 +2114,40 @@ const OPT_DEFAULT_INPUTS = [
   ["paradex_dir_limit_mult", 1.0],
   ["extended_dir_limit_mult", 1.0],
 
+  ["variational_fee_bps", 0],
+  ["binance_fee_bps", 0],
+  ["lighter_fee_bps", 0],
+  ["hyperliquid_fee_bps", 0],
+  ["01xyz_fee_bps", 0],
+  ["nado_fee_bps", 0],
+  ["pacifica_fee_bps", 0],
+  ["paradex_fee_bps", 0],
+  ["extended_fee_bps", 0],
+
+  ["variational_slippage_bps", 0],
+  ["binance_slippage_bps", 0],
+  ["lighter_slippage_bps", 0],
+  ["hyperliquid_slippage_bps", 0],
+  ["01xyz_slippage_bps", 0],
+  ["nado_slippage_bps", 0],
+  ["pacifica_slippage_bps", 0],
+  ["paradex_slippage_bps", 0],
+  ["extended_slippage_bps", 0],
+
+  ["use_live_slippage_api", "TRUE"],
+  ["slippage_api_url", OPT_DEFAULT_SLIPPAGE_API_URL],
+
+  ["binance_gross_max_mult", 5.0],
+  ["lighter_gross_max_mult", 5.0],
+  ["hyperliquid_gross_max_mult", 5.0],
+  ["01xyz_gross_max_mult", 5.0],
+  ["nado_gross_max_mult", 5.0],
+  ["pacifica_gross_max_mult", 5.0],
+  ["paradex_gross_max_mult", 5.0],
+  ["extended_gross_max_mult", 5.0],
+
   ["sol_cap_mult", 0.8],
   ["bnb_cap_mult", 0.8],
-
-  ["lighter_gross_max_mult", 5.0],
 
   ["enable_variational_booster", "TRUE"],
   ["booster_step_usd", 50000],
@@ -2112,6 +2161,102 @@ function funding_getDepositInputKey_(ex) {
 
 function funding_getDirLimitInputKey_(ex) {
   return `${ex}_dir_limit_mult`;
+}
+
+function funding_getGrossMaxMultInputKey_(ex) {
+  return `${ex}_gross_max_mult`;
+}
+
+function funding_getFeeBpsInputKey_(ex) {
+  return `${ex}_fee_bps`;
+}
+
+function funding_getSlippageBpsInputKey_(ex) {
+  return `${ex}_slippage_bps`;
+}
+
+function funding_getGrossMaxMultByExchange_(inputs) {
+  const out = {};
+  for (const ex of OPT_EXCHANGES) {
+    if (ex === "variational") {
+      out[ex] = Infinity;
+      continue;
+    }
+
+    let raw = inputs[funding_getGrossMaxMultInputKey_(ex)];
+    // backward compatibility for old sheets that only had lighter_gross_max_mult
+    if ((raw == null || String(raw).trim() === "") && ex === "lighter") {
+      raw = inputs["lighter_gross_max_mult"];
+    }
+    const mult = Number(raw);
+    out[ex] = Number.isFinite(mult) && mult > 0 ? mult : Infinity;
+  }
+  return out;
+}
+
+function funding_getTradingCostBpsByExchange_(inputs) {
+  const feeBps = {};
+  const slippageBps = {};
+  for (const ex of OPT_EXCHANGES) {
+    const fee = Number(inputs[funding_getFeeBpsInputKey_(ex)]);
+    const slip = Number(inputs[funding_getSlippageBpsInputKey_(ex)]);
+    feeBps[ex] = Number.isFinite(fee) && fee >= 0 ? fee : 0;
+    slippageBps[ex] = Number.isFinite(slip) && slip >= 0 ? slip : 0;
+  }
+  return { feeBps, slippageBps };
+}
+
+function funding_isTrueLike_(v) {
+  const s = String(v == null ? "" : v).trim().toUpperCase();
+  return s === "TRUE" || s === "1" || s === "YES" || s === "Y" || s === "ON";
+}
+
+function funding_buildSlippageApiEndpoint_(rawUrl) {
+  const base = String(rawUrl == null ? "" : rawUrl).trim() || OPT_DEFAULT_SLIPPAGE_API_URL;
+  if (!base) return "";
+  if (base.indexOf("/api/slippage") >= 0) return base;
+  return base.replace(/\/+$/, "") + "/api/slippage";
+}
+
+function funding_fetchLiveSlippageMap_(apiEndpoint, coin, qtyAbs, side) {
+  const qty = Number(qtyAbs);
+  if (!apiEndpoint || !coin || !(qty > 0)) return new Map();
+
+  const qs =
+    "coin=" + encodeURIComponent(String(coin).toUpperCase()) +
+    "&qty=" + encodeURIComponent(String(funding_round_(qty))) +
+    "&side=" + encodeURIComponent(String(side || "buy").toLowerCase());
+
+  const sep = apiEndpoint.indexOf("?") >= 0 ? "&" : "?";
+  const url = apiEndpoint + sep + qs;
+
+  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  const code = resp.getResponseCode();
+  const text = resp.getContentText();
+  if (code < 200 || code >= 300) {
+    throw new Error(`slippage API HTTP ${code}: ${text}`);
+  }
+
+  const payload = JSON.parse(text);
+  const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+  const out = new Map();
+  for (const r of rows) {
+    const status = String(r?.status || "").toLowerCase();
+    if (status && status !== "ok") continue;
+
+    const ex = String(r?.exchange || r?.id || r?.name || "").trim().toLowerCase();
+    if (!ex) continue;
+
+    const feeBps = Number(r?.feeBps ?? r?.fee_bps ?? 0);
+    const slippageBps = Number(r?.slippageBps ?? r?.slippage_bps ?? 0);
+
+    out.set(ex, {
+      feeBps: Number.isFinite(feeBps) ? feeBps : 0,
+      slippageBps: Number.isFinite(slippageBps) ? slippageBps : 0,
+      source: "live",
+    });
+  }
+  return out;
 }
 
 function funding_initOptimizerSheets() {
@@ -2203,6 +2348,8 @@ function funding_optimizeAllocation() {
     funding_refreshOptRates_();
   } catch (e) {}
 
+  // Keep opt_inputs schema up to date without overwriting user values.
+  funding_ensureKeyValues_(shInputs, OPT_DEFAULT_INPUTS);
   const inputs = funding_readKeyValues_(shInputs);
 
   const dep = {};
@@ -2222,7 +2369,7 @@ function funding_optimizeAllocation() {
     BNB: Number(inputs["bnb_cap_mult"] || 0.8),
   };
 
-  const lighterGrossMaxMult = Number(inputs["lighter_gross_max_mult"] || 5.0);
+  const grossMaxMult = funding_getGrossMaxMultByExchange_(inputs);
 
   const boosterEnabled = String(inputs["enable_variational_booster"] || "TRUE").toUpperCase() === "TRUE";
   const boosterStepUsd = Number(inputs["booster_step_usd"] || 50000);
@@ -2265,7 +2412,7 @@ function funding_optimizeAllocation() {
         dep,
         dirMult,
         capMult,
-        lighterGrossMaxMult,
+        grossMaxMult,
         state,
         rateMap,
         markFallback
@@ -2288,7 +2435,7 @@ function funding_optimizeAllocation() {
           dep,
           dirMult,
           capMult,
-          lighterGrossMaxMult,
+          grossMaxMult,
           state,
           rateMap,
           markFallback
@@ -2314,7 +2461,7 @@ function funding_optimizeAllocation() {
       dep,
       dirMult,
       capMult,
-      lighterGrossMaxMult,
+      grossMaxMult,
       rateMap,
       markFallback,
       minGrossVar,
@@ -2343,7 +2490,7 @@ function funding_optimizeAllocation() {
     dep,
     dirMult,
     capMult,
-    lighterGrossMaxMult,
+    grossMaxMult,
     minGrossVar
   );
 
@@ -2352,13 +2499,330 @@ function funding_optimizeAllocation() {
     dep,
     dirMult,
     capMult,
-    lighterGrossMaxMult,
+    grossMaxMult,
     rateMap,
     markFallback,
     minGrossVar
   );
 
-  safeAlert_("✅ Optimize allocation 완료\n\n" + summary.join("\n"));
+  let rebalanceText = "";
+  try {
+    const rebalance = funding_estimateRebalanceTradingCost_({ showAlert: false, writeSheet: true });
+    rebalanceText =
+      "\n\n[rebalance_trading_cost_estimate]\n" +
+      `turnover: ${funding_fmtUsd_(rebalance.totals.totalTurnoverUsd)}\n` +
+      `fee: ${funding_fmtUsd_(rebalance.totals.totalFeeUsd)}\n` +
+      `slippage: ${funding_fmtUsd_(rebalance.totals.totalSlippageUsd)}\n` +
+      `total_cost: ${funding_fmtUsd_(rebalance.totals.totalCostUsd)}`;
+  } catch (e) {
+    rebalanceText = `\n\n[rebalance_trading_cost_estimate] ERR: ${String(e && e.message ? e.message : e)}`;
+  }
+
+  safeAlert_("✅ Optimize allocation 완료\n\n" + summary.join("\n") + rebalanceText);
+}
+
+/**
+ * positions -> opt_solution 리밸런싱 시 발생하는 추정 거래비용(수수료+슬리피지) 계산
+ * - turnover_usd = |target_qty - current_qty| * mark_price
+ * - fee_usd = turnover_usd * fee_bps / 10000
+ * - slippage_usd = turnover_usd * slippage_bps / 10000
+ */
+function funding_estimateRebalanceTradingCostNow() {
+  const result = funding_estimateRebalanceTradingCost_({ showAlert: true, writeSheet: true });
+  return result;
+}
+
+function funding_estimateRebalanceTradingCost_(opts) {
+  const options = opts || {};
+  const showAlert = options.showAlert !== false;
+  const writeSheet = options.writeSheet !== false;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shPos = ss.getSheetByName(FUNDING_SHEET_POSITIONS);
+  const shSol = ss.getSheetByName(OPT_SHEET_SOLUTION);
+  const shInputs = ss.getSheetByName(OPT_SHEET_INPUTS);
+  const shRates = ss.getSheetByName(OPT_SHEET_RATES);
+  if (!shPos || !shSol || !shInputs || !shRates) {
+    throw new Error("positions / opt_solution / opt_inputs / opt_rates 시트를 확인해줘.");
+  }
+
+  funding_ensureKeyValues_(shInputs, OPT_DEFAULT_INPUTS);
+  const inputs = funding_readKeyValues_(shInputs);
+  const bps = funding_getTradingCostBpsByExchange_(inputs);
+  const useLiveRaw = inputs["use_live_slippage_api"];
+  const useLiveSlippage =
+    String(useLiveRaw == null ? "" : useLiveRaw).trim() === ""
+      ? true
+      : funding_isTrueLike_(useLiveRaw);
+  const slippageApiEndpoint = funding_buildSlippageApiEndpoint_(inputs["slippage_api_url"]);
+  const liveSlippageCache = new Map(); // key: SYMBOL|qty|side -> Map(exchange -> {feeBps, slippageBps, source})
+  const liveSlippageErrors = [];
+
+  // keep mark info fresh when available
+  try {
+    funding_refreshOptRates_();
+  } catch (_) {}
+
+  const rateMap = funding_readRates_(shRates);
+  const markFallback = funding_buildMarkFallback_(rateMap);
+
+  const currentQtyMap = funding_readPositionQtyMap_(shPos);
+  const targetMap = funding_readOptTargetMap_(shSol);
+  const keys = new Set([...currentQtyMap.keys(), ...targetMap.keys()]);
+
+  const symbolOrder = {};
+  for (let i = 0; i < OPT_SYMBOLS.length; i++) symbolOrder[OPT_SYMBOLS[i]] = i;
+
+  const rows = [];
+  const byEx = new Map();
+  let totalTurnover = 0;
+  let totalFee = 0;
+  let totalSlip = 0;
+  let totalCost = 0;
+  const missingMarks = [];
+
+  for (const key of keys) {
+    const parts = String(key).split("|");
+    if (parts.length !== 2) continue;
+    const ex = parts[0];
+    const sym = parts[1];
+    if (!OPT_EXCHANGES.includes(ex) || !OPT_SYMBOLS.includes(sym)) continue;
+
+    const currentQty = Number(currentQtyMap.get(key) || 0);
+    const tgt = targetMap.get(key) || { qty: 0, mark: null };
+    const targetQty = Number(tgt.qty || 0);
+    const deltaQty = funding_round_(targetQty - currentQty);
+    if (!Number.isFinite(deltaQty) || Math.abs(deltaQty) < 1e-12) continue;
+
+    const markDirect = Number(tgt.mark);
+    const markRate = Number((rateMap.get(key) || {}).mark);
+    const markFb = Number(markFallback[sym]);
+    const mark =
+      Number.isFinite(markDirect) && markDirect > 0
+        ? markDirect
+        : Number.isFinite(markRate) && markRate > 0
+          ? markRate
+          : Number.isFinite(markFb) && markFb > 0
+            ? markFb
+            : null;
+
+    if (!(mark > 0)) {
+      missingMarks.push(`${ex}|${sym}`);
+      continue;
+    }
+
+    const turnoverUsd = Math.abs(deltaQty) * mark;
+    const side = deltaQty > 0 ? "buy" : "sell";
+
+    let feeBps = Number(bps.feeBps[ex] || 0);
+    let slipBps = Number(bps.slippageBps[ex] || 0);
+    let bpsSource = "manual";
+
+    if (useLiveSlippage && slippageApiEndpoint) {
+      const liveKey = `${sym}|${funding_round_(Math.abs(deltaQty))}|${side}`;
+      let liveMap = liveSlippageCache.get(liveKey);
+      if (!liveMap) {
+        try {
+          liveMap = funding_fetchLiveSlippageMap_(slippageApiEndpoint, sym, Math.abs(deltaQty), side);
+        } catch (e) {
+          liveMap = new Map();
+          liveSlippageErrors.push(`${liveKey}: ${String(e && e.message ? e.message : e)}`);
+        }
+        liveSlippageCache.set(liveKey, liveMap);
+      }
+      const live = liveMap.get(ex);
+      if (live) {
+        feeBps = Number(live.feeBps || 0);
+        slipBps = Number(live.slippageBps || 0);
+        bpsSource = "live";
+      } else {
+        bpsSource = "manual_fallback";
+      }
+    }
+
+    const feeUsd = turnoverUsd * feeBps / 10000;
+    const slippageUsd = turnoverUsd * slipBps / 10000;
+    const totalUsd = feeUsd + slippageUsd;
+
+    totalTurnover += turnoverUsd;
+    totalFee += feeUsd;
+    totalSlip += slippageUsd;
+    totalCost += totalUsd;
+
+    if (!byEx.has(ex)) byEx.set(ex, { turnoverUsd: 0, feeUsd: 0, slippageUsd: 0, totalCostUsd: 0 });
+    const acc = byEx.get(ex);
+    acc.turnoverUsd += turnoverUsd;
+    acc.feeUsd += feeUsd;
+    acc.slippageUsd += slippageUsd;
+    acc.totalCostUsd += totalUsd;
+
+    rows.push([
+      ex,
+      sym,
+      currentQty,
+      targetQty,
+      deltaQty,
+      mark,
+      turnoverUsd,
+      feeBps,
+      slipBps,
+      feeUsd,
+      slippageUsd,
+      totalUsd,
+      side,
+      bpsSource,
+    ]);
+  }
+
+  if (missingMarks.length) {
+    const sample = missingMarks.slice(0, 8).join(", ");
+    throw new Error(`리밸런싱 mark_price 누락: ${sample}${missingMarks.length > 8 ? " ..." : ""}`);
+  }
+
+  rows.sort((a, b) => {
+    const exA = EX_ORDER[String(a[0] || "").toLowerCase()] ?? 999;
+    const exB = EX_ORDER[String(b[0] || "").toLowerCase()] ?? 999;
+    if (exA !== exB) return exA - exB;
+    const sA = symbolOrder[String(a[1] || "").toUpperCase()] ?? 999;
+    const sB = symbolOrder[String(b[1] || "").toUpperCase()] ?? 999;
+    return sA - sB;
+  });
+
+  const asOf = funding_nowKstIso_();
+  if (writeSheet) {
+    funding_writeRebalanceCostSheet_(ss, asOf, rows, byEx, {
+      totalTurnoverUsd: totalTurnover,
+      totalFeeUsd: totalFee,
+      totalSlippageUsd: totalSlip,
+      totalCostUsd: totalCost,
+    });
+  }
+
+  if (showAlert) {
+    const liveQueryCount = useLiveSlippage ? liveSlippageCache.size : 0;
+    const liveErrCount = liveSlippageErrors.length;
+    safeAlert_(
+      "✅ Rebalance 거래비용 추정 완료\n" +
+      `asOf: ${asOf}\n` +
+      `turnover: ${funding_fmtUsd_(totalTurnover)}\n` +
+      `fee: ${funding_fmtUsd_(totalFee)}\n` +
+      `slippage: ${funding_fmtUsd_(totalSlip)}\n` +
+      `total_cost: ${funding_fmtUsd_(totalCost)}\n` +
+      `trades: ${rows.length}` +
+      (useLiveSlippage ? `\nlive_slippage_queries: ${liveQueryCount}` : "") +
+      (useLiveSlippage ? `\nlive_slippage_errors: ${liveErrCount}` : "")
+    );
+  }
+
+  return {
+    asOf,
+    rows,
+    byExchange: byEx,
+    totals: {
+      totalTurnoverUsd: totalTurnover,
+      totalFeeUsd: totalFee,
+      totalSlippageUsd: totalSlip,
+      totalCostUsd: totalCost,
+    },
+  };
+}
+
+function funding_readPositionQtyMap_(shPos) {
+  const out = new Map();
+  const lastRow = shPos.getLastRow();
+  if (lastRow < 2) return out;
+
+  const header = shPos.getRange(1, 1, 1, shPos.getLastColumn()).getValues()[0].map((v) => String(v || "").trim());
+  const iEx = header.indexOf("exchange");
+  const iSym = header.indexOf("symbol");
+  const iQty = header.indexOf("qty");
+  if ([iEx, iSym, iQty].some((x) => x < 0)) return out;
+
+  const vals = shPos.getRange(2, 1, lastRow - 1, shPos.getLastColumn()).getValues();
+  for (const row of vals) {
+    const ex = String(row[iEx] || "").trim().toLowerCase();
+    const sym = String(row[iSym] || "").trim().toUpperCase();
+    if (!ex || !sym) continue;
+    if (!OPT_EXCHANGES.includes(ex) || !OPT_SYMBOLS.includes(sym)) continue;
+    const qty = Number(row[iQty]);
+    out.set(`${ex}|${sym}`, Number.isFinite(qty) ? qty : 0);
+  }
+  return out;
+}
+
+function funding_readOptTargetMap_(shSol) {
+  const out = new Map();
+  const lastRow = shSol.getLastRow();
+  if (lastRow < 2) return out;
+
+  const header = shSol.getRange(1, 1, 1, shSol.getLastColumn()).getValues()[0].map((v) => String(v || "").trim());
+  const iEx = header.indexOf("exchange");
+  const iSym = header.indexOf("symbol");
+  const iQty = header.indexOf("qty");
+  const iMark = header.indexOf("mark_price");
+  if ([iEx, iSym, iQty].some((x) => x < 0)) return out;
+
+  const vals = shSol.getRange(2, 1, lastRow - 1, shSol.getLastColumn()).getValues();
+  for (const row of vals) {
+    const ex = String(row[iEx] || "").trim().toLowerCase();
+    const sym = String(row[iSym] || "").trim().toUpperCase();
+    if (!ex || !sym) continue;
+    if (!OPT_EXCHANGES.includes(ex) || !OPT_SYMBOLS.includes(sym)) continue;
+
+    const qty = Number(row[iQty]);
+    const mark = iMark >= 0 ? Number(row[iMark]) : NaN;
+    out.set(`${ex}|${sym}`, {
+      qty: Number.isFinite(qty) ? qty : 0,
+      mark: Number.isFinite(mark) && mark > 0 ? mark : null,
+    });
+  }
+  return out;
+}
+
+function funding_writeRebalanceCostSheet_(ss, asOf, rows, byEx, totals) {
+  const sh = ss.getSheetByName(OPT_SHEET_REBALANCE_COST) || ss.insertSheet(OPT_SHEET_REBALANCE_COST);
+
+  const width = 14;
+  const maxCols = Math.max(sh.getMaxColumns(), width);
+  sh.getRange(1, 1, sh.getMaxRows(), maxCols).clearContent();
+
+  sh.getRange(1, 1, 1, 2).setValues([["asOf", asOf]]);
+  sh.getRange(2, 1, 1, 2).setValues([["TOTAL turnover_usd", totals.totalTurnoverUsd || 0]]);
+  sh.getRange(3, 1, 1, 2).setValues([["TOTAL fee_usd", totals.totalFeeUsd || 0]]);
+  sh.getRange(4, 1, 1, 2).setValues([["TOTAL slippage_usd", totals.totalSlippageUsd || 0]]);
+  sh.getRange(5, 1, 1, 2).setValues([["TOTAL trading_cost_usd", totals.totalCostUsd || 0]]);
+
+  const detailHeader = [
+    "exchange",
+    "symbol",
+    "current_qty",
+    "target_qty",
+    "delta_qty",
+    "mark_price",
+    "turnover_usd",
+    "fee_bps",
+    "slippage_bps",
+    "fee_usd",
+    "slippage_usd",
+    "total_cost_usd",
+    "trade_side",
+    "bps_source",
+  ];
+  sh.getRange(7, 1, 1, width).setValues([detailHeader]);
+  if (rows.length) sh.getRange(8, 1, rows.length, width).setValues(rows);
+
+  const summaryStart = 8 + rows.length + 2;
+  sh.getRange(summaryStart, 1, 1, 5).setValues([["exchange_summary", "turnover_usd", "fee_usd", "slippage_usd", "total_cost_usd"]]);
+
+  const exRows = Array.from(byEx.entries())
+    .sort((a, b) => {
+      const exA = EX_ORDER[String(a[0] || "").toLowerCase()] ?? 999;
+      const exB = EX_ORDER[String(b[0] || "").toLowerCase()] ?? 999;
+      return exA - exB;
+    })
+    .map(([ex, v]) => [ex, v.turnoverUsd, v.feeUsd, v.slippageUsd, v.totalCostUsd]);
+
+  if (exRows.length) sh.getRange(summaryStart + 1, 1, exRows.length, 5).setValues(exRows);
 }
 
 /* =========================
@@ -2483,7 +2947,7 @@ function funding_maxDeltaQtyAllowed_(
   dep,
   dirMult,
   capMult,
-  lighterGrossMaxMult,
+  grossMaxMult,
   state,
   rateMap,
   markFallback
@@ -2499,7 +2963,8 @@ function funding_maxDeltaQtyAllowed_(
   const prevAbsNot = Math.abs(prevQty * mark);
 
   const dirLimit = (dep[ex] || 0) * (dirMult[ex] || 0);
-  const grossMax = ex === "lighter" ? (dep[ex] || 0) * lighterGrossMaxMult : Infinity;
+  const grossMult = Number(grossMaxMult[ex]);
+  const grossMax = ex === "variational" || !Number.isFinite(grossMult) ? Infinity : (dep[ex] || 0) * grossMult;
 
   let low = -Infinity;
   let high = Infinity;
@@ -2512,7 +2977,7 @@ function funding_maxDeltaQtyAllowed_(
     high = Math.min(high, Math.max(a, b));
   }
 
-  // (2) Gross max (lighter only)
+  // (2) Gross max (all non-variational exchanges with *_gross_max_mult)
   if (Number.isFinite(grossMax)) {
     const grossWithoutSym = curGross - prevAbsNot;
     const remainAbsNot = grossMax - grossWithoutSym;
@@ -2585,7 +3050,7 @@ function funding_applyVariationalBooster_(
   dep,
   dirMult,
   capMult,
-  lighterGrossMaxMult,
+  grossMaxMult,
   rateMap,
   markFallback,
   minGrossVar,
@@ -2593,10 +3058,11 @@ function funding_applyVariationalBooster_(
   assets,
   hedgeOrder
 ) {
-  const statsVar = funding_calcExchangeStatsFromAlloc_(alloc, "variational", rateMap, markFallback);
-  const statsB = funding_calcExchangeStatsFromAlloc_(alloc, "binance", rateMap, markFallback);
-  const statsL = funding_calcExchangeStatsFromAlloc_(alloc, "lighter", rateMap, markFallback);
-  const stats = { variational: statsVar, binance: statsB, lighter: statsL };
+  // Build stats for all exchanges so any hedge_order member can be used safely.
+  const stats = {};
+  for (const ex of OPT_EXCHANGES) {
+    stats[ex] = funding_calcExchangeStatsFromAlloc_(alloc, ex, rateMap, markFallback);
+  }
 
   if (!Number.isFinite(minGrossVar) || minGrossVar <= 0) return;
   if (!Number.isFinite(stepUsd) || stepUsd <= 0) throw new Error("booster_step_usd가 0이거나 비정상");
@@ -2608,7 +3074,12 @@ function funding_applyVariationalBooster_(
     .filter((s) => OPT_SYMBOLS.includes(s));
   if (pool.length < 2) throw new Error("booster_assets는 최소 2개 심볼이 필요해. 예: BTC,ETH");
 
-  const ligGrossMax = (Number(dep.lighter) || 0) * (Number(lighterGrossMaxMult) || 0);
+  const grossMaxByEx = {};
+  for (const ex of OPT_EXCHANGES) {
+    const mult = Number(grossMaxMult[ex]);
+    grossMaxByEx[ex] = ex === "variational" || !Number.isFinite(mult) ? Infinity : (Number(dep[ex]) || 0) * mult;
+  }
+  const ligGrossMax = grossMaxByEx.lighter;
 
   // ✅ 라이터를 부스터가 다 잡아먹지 않게 reserve 확보
   const lighterReserveGross = ligGrossMax > 0 ? Math.min(ligGrossMax * 0.2, 2 * stepUsd) : 0;
@@ -2709,10 +3180,11 @@ function funding_applyVariationalBooster_(
       if (!OPT_EXCHANGES.includes(hedgeEx)) continue;
       if (hedgeEx === "variational") continue;
 
-      if (hedgeEx === "lighter") {
-        if (!(ligGrossMax > 0)) continue;
-        const after = stats.lighter.gross + 2 * blockUsd; // 후보 필터는 보수적으로 유지
-        const safeMax = ligGrossMax - lighterReserveGross;
+      const hedgeGrossMax = Number(grossMaxByEx[hedgeEx]);
+      if (Number.isFinite(hedgeGrossMax)) {
+        const reserve = hedgeEx === "lighter" ? lighterReserveGross : 0;
+        const after = Number(stats[hedgeEx].gross || 0) + 2 * blockUsd; // 후보 필터는 보수적으로 유지
+        const safeMax = hedgeGrossMax - reserve;
         if (after > safeMax + 1e-6) continue;
       }
 
@@ -2772,8 +3244,8 @@ function funding_applyVariationalBooster_(
         `Variational min gross OI를 더 이상 채울 수 없어.\n` +
           `현재 var gross=${stats.variational.gross.toFixed(2)} / min=${minGrossVar.toFixed(2)}\n` +
           `lighter gross=${stats.lighter.gross.toFixed(2)} / safeMax=${(safeMax > 0 ? safeMax : 0).toFixed(2)} (reserve=${lighterReserveGross.toFixed(2)})\n` +
-          `가능 원인: SOL/BNB cap 제한, lighter safeMax 제한, hedge_order 후보 부족, mark/rate 누락.\n` +
-          `해결: booster_assets(BTC,ETH) 유지 / hedge_order에 binance 포함 / sol_cap_mult·bnb_cap_mult 완화 / lighter_gross_max_mult 상향`
+          `가능 원인: SOL/BNB cap 제한, hedge 거래소 gross_max 제한, hedge_order 후보 부족, mark/rate 누락.\n` +
+          `해결: booster_assets(BTC,ETH) 유지 / hedge_order 확장 / sol_cap_mult·bnb_cap_mult 완화 / 각 거래소 *_gross_max_mult 상향`
       );
     }
 
@@ -2799,7 +3271,7 @@ function funding_writeOptSolution_(
   dep,
   dirMult,
   capMult,
-  lighterGrossMaxMult,
+  grossMaxMult,
   minGrossVar
 ) {
   const maxRows = shSol.getMaxRows();
@@ -2852,10 +3324,12 @@ function funding_writeOptSolution_(
   for (const ex of OPT_EXCHANGES) {
     const s = funding_calcExchangeStatsFromAlloc_(alloc, ex, rateMap, markFallback);
     const dirLimit = (dep[ex] || 0) * (dirMult[ex] || 0);
+    const grossMult = Number(grossMaxMult[ex]);
+    const grossMax = ex === "variational" || !Number.isFinite(grossMult) ? null : (dep[ex] || 0) * grossMult;
 
     let grossRule = "";
     if (ex === "variational") grossRule = `min ${Number(minGrossVar || 0).toFixed(0)}`;
-    else if (ex === "lighter") grossRule = `max ${(dep[ex] || 0) * (lighterGrossMaxMult || 0)}`;
+    else if (grossMax != null) grossRule = `max ${Number(grossMax).toFixed(0)}`;
     else grossRule = "none";
 
     const solCap = (dep[ex] || 0) * (capMult.SOL || 0);
@@ -2867,13 +3341,14 @@ function funding_writeOptSolution_(
   if (rows.length) shSol.getRange(summaryStart + 1, 1, rows.length, 9).setValues(rows);
 }
 
-function funding_buildConstraintSummary_(alloc, dep, dirMult, capMult, lighterGrossMaxMult, rateMap, markFallback, minGrossVar) {
+function funding_buildConstraintSummary_(alloc, dep, dirMult, capMult, grossMaxMult, rateMap, markFallback, minGrossVar) {
   const lines = [];
 
   for (const ex of OPT_EXCHANGES) {
     const s = funding_calcExchangeStatsFromAlloc_(alloc, ex, rateMap, markFallback);
     const dirLimit = dep[ex] * dirMult[ex];
-    const grossMax = ex === "lighter" ? dep[ex] * lighterGrossMaxMult : null;
+    const grossMult = Number(grossMaxMult[ex]);
+    const grossMax = ex === "variational" || !Number.isFinite(grossMult) ? null : dep[ex] * grossMult;
 
     const okDir = Math.abs(s.dir) <= dirLimit + 1e-6;
 
@@ -2882,7 +3357,7 @@ function funding_buildConstraintSummary_(alloc, dep, dirMult, capMult, lighterGr
     if (ex === "variational") {
       okGross = s.gross >= minGrossVar - 1e-6;
       grossMsg = `gross ${funding_fmtUsd_(s.gross)} (min ${funding_fmtUsd_(minGrossVar)})`;
-    } else if (ex === "lighter") {
+    } else if (grossMax != null) {
       okGross = grossMax == null ? true : s.gross <= grossMax + 1e-6;
       grossMsg = `gross ${funding_fmtUsd_(s.gross)} (max ${funding_fmtUsd_(grossMax)})`;
     } else {
