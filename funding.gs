@@ -42,6 +42,8 @@ const FUNDING_SHEET_POSITIONS = "positions";
 const FUNDING_SHEET_HISTORY_8H = "funding_history";
 const FUNDING_SHEET_HOURLY = "lighter_hourly_history"; // legacy name 유지
 const FUNDING_SHEET_LIGHTER_HOURLY = "lighter_hourly_history";
+const FUNDING_SHEET_SUMMARY = "funding_summary";
+const FUNDING_SHEET_VARIATIONAL_VIEW = "variational_funding_view";
 
 const FUNDING_HOURLY_EXCHANGES_CONFIG_KEY = "hourly_exchanges";
 const FUNDING_DEFAULT_HOURLY_EXCHANGES = ["lighter", "hyperliquid", "01xyz", "nado", "pacifica", "extended"];
@@ -50,7 +52,7 @@ const FUNDING_HOURLY_LOOKBACK_HOURS = 8;
 const FUNDING_LAST_SLOT_KEY_HOURLY = "FUNDING_LAST_SLOT_KEY_HOURLY";
 const FUNDING_LAST_SLOT_KEY_LIGHTER_HOURLY = "FUNDING_LAST_SLOT_KEY_LIGHTER_HOURLY"; // backward compat
 
-const EX_ORDER = { variational: 0, binance: 1, lighter: 2, hyperliquid: 3, "01xyz": 4, nado: 5, pacifica: 6, paradex: 7, extended: 8 };
+const EX_ORDER = { variational: 0, variational_2: 1, binance: 2, lighter: 3, hyperliquid: 4, "01xyz": 5, nado: 6, pacifica: 7, paradex: 8, extended: 9 };
 
 // default API URL
 const DEFAULT_FUNDING_API_URL = "https://fundingrate-auto.vercel.app/api/funding-8h";
@@ -71,7 +73,7 @@ const SLOT_TOL_BEFORE_MIN = 50;
 const SLOT_TOL_AFTER_MIN = 8;
 
 // symbols
-const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
+const TARGETS = ["BTC", "ETH", "SOL", "BNB", "HYPE"];
 
 /** =========================
  * Rolling funding PnL config (strict: 부족하면 0)
@@ -82,30 +84,40 @@ const FUNDING_ROLL_MIN_COVERAGE = 0.5; // coverage < 0.5 => insufficient->0
 const FUNDING_POS_SUMMARY_ANCHOR_PROP = "FUNDING_POS_SUMMARY_ANCHOR_COL";
 const FUNDING_ROLLING_SUMMARY_ANCHOR_PROP = "FUNDING_ROLLING_SUMMARY_ANCHOR_COL";
 const FUNDING_OPT_ROLLING_SUMMARY_ANCHOR_PROP = "FUNDING_OPT_ROLLING_SUMMARY_ANCHOR_COL";
+const FUNDING_POS_SUMMARY_WIDTH = 5;
+const FUNDING_POS_SUMMARY_GAP = 3;
+const FUNDING_ROLLING_SUMMARY_WIDTH = 13;
+const FUNDING_ROLLING_SUMMARY_CLEAR_ROWS = 40;
+
+function funding_getPositionsDataEndCol_(shPos) {
+  return (
+    funding_findRow1TextCol_(shPos, "funding_pnl_day_usd") ||
+    funding_findRow1TextCol_(shPos, "funding_pnl_8h_usd") ||
+    funding_findRow1TextCol_(shPos, "interval_s") ||
+    funding_findRow1TextCol_(shPos, "funding_rate_8h") ||
+    funding_findRow1TextCol_(shPos, "mark_price") ||
+    funding_findRow1TextCol_(shPos, "qty") ||
+    shPos.getLastColumn()
+  );
+}
+
+function funding_findFirstVisibleColAtOrAfter_(sh, startCol) {
+  let c = Math.max(1, Number(startCol) || 1);
+  const maxCols = Math.max(sh.getMaxColumns(), c);
+  funding_ensureSheetHasCols_(sh, c);
+  while (c <= maxCols && sh.isColumnHiddenByUser(c)) c++;
+  return c;
+}
 
 /**
  * ✅ positions(8h/day) 요약 시작열 고정 앵커
- * - 이미 저장돼 있으면 그 값을 사용
- * - 없으면: 현재 마지막 컬럼 + 2 로 잡아서 저장
+ * - 항상 core data 끝 바로 오른쪽에 고정
+ * - 예전 저장 앵커가 뒤집혀 있어도 다음 실행에서 바로 정상 위치로 복구
  */
 function funding_getPositionsSummaryAnchorCol_(shPos) {
   const props = PropertiesService.getScriptProperties();
-  const saved = Number(props.getProperty(FUNDING_POS_SUMMARY_ANCHOR_PROP) || 0);
-  if (Number.isFinite(saved) && saved > 0) return saved;
-
-  // Reuse existing left-most summary block if it exists.
-  const existing = funding_findRow1TextCol_(shPos, "asOf");
-  if (existing) {
-    props.setProperty(FUNDING_POS_SUMMARY_ANCHOR_PROP, String(existing));
-    return existing;
-  }
-
-  // Prefer anchoring next to core data headers, not sheet tail (prevents right drift).
-  const endCol =
-    funding_findRow1TextCol_(shPos, "funding_pnl_all_usd") ||
-    funding_findRow1TextCol_(shPos, "funding_pnl_day_usd") ||
-    shPos.getLastColumn();
-  const anchor = endCol + 2;
+  const endCol = funding_getPositionsDataEndCol_(shPos);
+  const anchor = funding_findFirstVisibleColAtOrAfter_(shPos, endCol + 2);
   props.setProperty(FUNDING_POS_SUMMARY_ANCHOR_PROP, String(anchor));
   return anchor;
 }
@@ -116,18 +128,8 @@ function funding_getPositionsSummaryAnchorCol_(shPos) {
  */
 function funding_getRollingSummaryAnchorCol_(shPos) {
   const props = PropertiesService.getScriptProperties();
-  const saved = Number(props.getProperty(FUNDING_ROLLING_SUMMARY_ANCHOR_PROP) || 0);
-  if (Number.isFinite(saved) && saved > 0) return saved;
-
-  // Reuse existing left-most rolling summary if present.
-  const existing = funding_findRow1TextCol_(shPos, "ROLLING TOTAL funding_pnl");
-  if (existing) {
-    props.setProperty(FUNDING_ROLLING_SUMMARY_ANCHOR_PROP, String(existing));
-    return existing;
-  }
-
   const posAnchor = funding_getPositionsSummaryAnchorCol_(shPos);
-  const anchor = posAnchor + 8; // pos 요약폭 5 + 여유 3
+  const anchor = funding_findFirstVisibleColAtOrAfter_(shPos, posAnchor + FUNDING_POS_SUMMARY_WIDTH + FUNDING_POS_SUMMARY_GAP);
   props.setProperty(FUNDING_ROLLING_SUMMARY_ANCHOR_PROP, String(anchor));
   return anchor;
 }
@@ -174,12 +176,14 @@ function funding_clearDuplicateOptRollingBlocks_(shOpt, keepCol) {
   if (lastCol < 1) return;
   const row1 = shOpt.getRange(1, 1, 1, lastCol).getValues()[0].map((v) => String(v || "").trim());
   const CLEAR_ROWS = 30;
-  const WIDTH = 7;
+  const WIDTH = 13;
   for (let i = 0; i < row1.length; i++) {
     if (row1[i] !== "OPT ROLLING TOTAL funding_pnl") continue;
     const c = i + 1;
     if (c === keepCol) continue;
-    shOpt.getRange(1, c, CLEAR_ROWS, WIDTH).clearContent();
+    if (c > shOpt.getMaxColumns()) continue;
+    const w = Math.min(WIDTH, shOpt.getMaxColumns() - c + 1);
+    if (w > 0) shOpt.getRange(1, c, CLEAR_ROWS, w).clearContent();
   }
 }
 
@@ -197,18 +201,81 @@ function funding_clearDuplicatePositionsSummaryBlocks_(shPos, keepCol) {
   }
 }
 
+function funding_relocatePositionsSummaryBlockIfNeeded_(shPos) {
+  const desiredCol = funding_getPositionsSummaryAnchorCol_(shPos);
+  const lastCol = shPos.getLastColumn();
+  if (lastCol < 1) return desiredCol;
+
+  const row1 = shPos.getRange(1, 1, 1, lastCol).getValues()[0].map((v) => String(v || "").trim());
+  const existingCols = [];
+  for (let i = 0; i < row1.length; i++) {
+    if (row1[i] === "asOf") existingCols.push(i + 1);
+  }
+  if (!existingCols.length) return desiredCol;
+
+  const sourceCol = existingCols[0];
+  if (existingCols.length === 1 && sourceCol === desiredCol) return desiredCol;
+
+  funding_ensureSheetHasCols_(shPos, desiredCol + FUNDING_POS_SUMMARY_WIDTH - 1);
+
+  const values = shPos
+    .getRange(1, sourceCol, 30, FUNDING_POS_SUMMARY_WIDTH)
+    .getValues();
+
+  shPos.getRange(1, desiredCol, 30, FUNDING_POS_SUMMARY_WIDTH).clearContent();
+  shPos.getRange(1, desiredCol, 30, FUNDING_POS_SUMMARY_WIDTH).setValues(values);
+
+  funding_clearDuplicatePositionsSummaryBlocks_(shPos, desiredCol);
+  return desiredCol;
+}
+
 function funding_clearDuplicateRollingSummaryBlocks_(shPos, keepCol) {
   const lastCol = shPos.getLastColumn();
   if (lastCol < 1) return;
   const row1 = shPos.getRange(1, 1, 1, lastCol).getValues()[0].map((v) => String(v || "").trim());
-  const CLEAR_ROWS = 40;
-  const SUMMARY_WIDTH = 7;
   for (let i = 0; i < row1.length; i++) {
     if (row1[i] !== "ROLLING TOTAL funding_pnl") continue;
     const c = i + 1;
     if (c === keepCol) continue;
-    shPos.getRange(1, c, CLEAR_ROWS, SUMMARY_WIDTH).clearContent();
+    if (c > shPos.getMaxColumns()) continue;
+    const w = Math.min(FUNDING_ROLLING_SUMMARY_WIDTH, shPos.getMaxColumns() - c + 1);
+    if (w > 0) shPos.getRange(1, c, FUNDING_ROLLING_SUMMARY_CLEAR_ROWS, w).clearContent();
   }
+}
+
+function funding_relocateRollingSummaryBlockIfNeeded_(shPos) {
+  const desiredCol = funding_getRollingSummaryAnchorCol_(shPos);
+  const lastCol = shPos.getLastColumn();
+  if (lastCol < 1) return;
+
+  const row1 = shPos.getRange(1, 1, 1, lastCol).getValues()[0].map((v) => String(v || "").trim());
+  const existingCols = [];
+  for (let i = 0; i < row1.length; i++) {
+    if (row1[i] === "ROLLING TOTAL funding_pnl") existingCols.push(i + 1);
+  }
+  if (!existingCols.length) return;
+
+  const sourceCol = existingCols[0];
+  if (existingCols.length === 1 && sourceCol === desiredCol) return;
+
+  funding_ensureSheetHasCols_(shPos, desiredCol + FUNDING_ROLLING_SUMMARY_WIDTH - 1);
+
+  const values = shPos
+    .getRange(1, sourceCol, FUNDING_ROLLING_SUMMARY_CLEAR_ROWS, FUNDING_ROLLING_SUMMARY_WIDTH)
+    .getValues();
+
+  shPos.getRange(1, desiredCol, FUNDING_ROLLING_SUMMARY_CLEAR_ROWS, FUNDING_ROLLING_SUMMARY_WIDTH).clearContent();
+  shPos.getRange(1, desiredCol, FUNDING_ROLLING_SUMMARY_CLEAR_ROWS, FUNDING_ROLLING_SUMMARY_WIDTH).setValues(values);
+
+  funding_clearDuplicateRollingSummaryBlocks_(shPos, desiredCol);
+}
+
+function funding_ensureSheetHasCols_(sh, needLastCol) {
+  const need = Number(needLastCol) || 0;
+  if (!(need > 0)) return;
+  const cur = sh.getMaxColumns();
+  if (cur >= need) return;
+  sh.insertColumnsAfter(cur, need - cur);
 }
 
 /**
@@ -238,6 +305,7 @@ function funding_addMenu_() {
       .addItem("Init sheets (current/positions)", "funding_initSheets")
       .addSeparator()
       .addItem("Init optimizer sheets (opt_*)", "funding_initOptimizerSheets")
+      .addItem("Sync optimizer venues/assets", "funding_syncOptimizerRegistryNow")
       .addItem("Refresh opt_rates (from funding_current)", "funding_refreshOptRates_")
       .addSeparator()
       .addItem("Update current now (no history)", "funding_updateCurrentNow")
@@ -245,6 +313,8 @@ function funding_addMenu_() {
       .addItem("Seed positions rows (all exchanges)", "funding_seedPositionsTemplateRowsNow")
       .addItem("Update rolling funding PnL (3/7/15d)", "funding_updatePositionsRollingFundingPnl_3_7_15_30_all") // ✅ rolling pnl
       .addItem("Update OPT rolling funding PnL (3/7/15/30/all)", "funding_updateOptSolutionRollingFundingPnl_3_7_15_30_all")
+      .addItem("Update pair cumulative funding (3/7/15/30/all)", "funding_updateExchangePairCumulativeFunding_3_7_15_30_all")
+      .addItem("Update Variational funding history view", "funding_updateVariationalFundingHistoryView")
       .addItem("Update current + positions", "funding_updateCurrentAndPositionsNow")
       .addSeparator()
       .addItem("Optimize allocation (maximize funding)", "funding_optimizeAllocation")
@@ -777,6 +847,28 @@ function funding_initSheet_(ss, name, headers) {
   const sh = ss.getSheetByName(name) || ss.insertSheet(name);
   sh.getRange(1, 1, 1, headers.length).setValues([headers]);
   return sh;
+}
+
+function funding_isSpreadsheetTimeout_(error) {
+  const message = String(error && error.message ? error.message : error || "");
+  return /spreadsheet service.*timed out|service spreadsheets.*timed out|스프레드시트 서비스가 타임아웃/i.test(message);
+}
+
+function funding_withSpreadsheetRetry_(label, fn, maxAttempts) {
+  const attempts = Math.max(1, Number(maxAttempts) || 4);
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return fn();
+    } catch (error) {
+      lastError = error;
+      if (!funding_isSpreadsheetTimeout_(error) || attempt >= attempts) break;
+      Logger.log(`${label} spreadsheet timeout (${attempt}/${attempts}); retrying`);
+      try { SpreadsheetApp.flush(); } catch (flushError) {}
+      Utilities.sleep(Math.min(8000, 1000 * Math.pow(2, attempt - 1)));
+    }
+  }
+  throw new Error(`${label} 실패 (${attempts}회 시도): ${String(lastError && lastError.message ? lastError.message : lastError)}`);
 }
 function funding_getConfigValue_(shConfig, key) {
   if (!shConfig) return "";
@@ -1372,7 +1464,14 @@ function funding_updatePositionsPnl() {
     throw new Error("positions 헤더에 exchange/symbol/qty가 없어. Init sheets를 다시 확인해줘.");
   }
 
+  // Preserve user-entered qty formulas such as =자산현황!...
+  const qtyFormulas = shPos
+    .getRange(2, cQty + 1, posLastRow - 1, 1)
+    .getFormulas()
+    .map((row) => String(row[0] || ""));
+
   const posVals = shPos.getRange(2, 1, posLastRow - 1, shPos.getLastColumn()).getValues();
+  const venueFundingMap = funding_getVenueFundingExchangeMapSafe_(ss);
 
   let total8h = 0;
   let totalDay = 0;
@@ -1399,7 +1498,8 @@ function funding_updatePositionsPnl() {
       continue;
     }
 
-    const key = `${ex}|${sym}`;
+    const fundingEx = venueFundingMap.get(ex) || ex;
+    const key = `${fundingEx}|${sym}`;
     const cur = curMap.get(key);
 
     if (!cur) {
@@ -1448,6 +1548,13 @@ function funding_updatePositionsPnl() {
     shPos.getRange(2, c + 1, posVals.length, 1).setValues(colVals);
   }
 
+  // Re-apply qty formulas so updates never replace sheet-linked position cells.
+  for (let r = 0; r < qtyFormulas.length; r++) {
+    const formula = qtyFormulas[r];
+    if (!formula) continue;
+    shPos.getRange(r + 2, cQty + 1).setFormula(formula);
+  }
+
   funding_writePositionsSummary_(shPos, currentAsOf, total8h, totalDay, byEx);
 
   const lines = [];
@@ -1468,11 +1575,13 @@ function funding_updatePositionsPnl() {
  * - 항상 같은 박스에 덮어씀
  */
 function funding_writePositionsSummary_(shPos, asOf, total8h, totalDay, byEx) {
-  const c0 = funding_getPositionsSummaryAnchorCol_(shPos);
+  const c0 = funding_relocatePositionsSummaryBlockIfNeeded_(shPos);
   const startRow = 1;
 
-  const SUMMARY_WIDTH = 5;
+  const SUMMARY_WIDTH = FUNDING_POS_SUMMARY_WIDTH;
   const SUMMARY_HEIGHT = 30;
+
+  funding_ensureSheetHasCols_(shPos, c0 + SUMMARY_WIDTH - 1);
 
   // Clean accidental duplicate blocks created on the right.
   funding_clearDuplicatePositionsSummaryBlocks_(shPos, c0);
@@ -1498,6 +1607,8 @@ function funding_writePositionsSummary_(shPos, asOf, total8h, totalDay, byEx) {
   if (rows.length) {
     shPos.getRange(6, c0, rows.length, 5).setValues(rows);
   }
+
+  funding_relocateRollingSummaryBlockIfNeeded_(shPos);
 }
 
 
@@ -1573,6 +1684,7 @@ function funding_updatePositionsRollingFundingPnl_3_7_15_30_all() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const shPos = ss.getSheetByName(FUNDING_SHEET_POSITIONS);
   if (!shPos) throw new Error("positions 시트를 찾을 수 없어.");
+  const venueFundingMap = funding_getVenueFundingExchangeMapSafe_(ss);
 
   const lastRow = shPos.getLastRow();
   if (lastRow < 2) throw new Error("positions 시트에 포지션이 없어. (2행부터 exchange/symbol/qty 입력)");
@@ -1665,7 +1777,7 @@ function funding_updatePositionsRollingFundingPnl_3_7_15_30_all() {
   const rows = rng.getValues();
 
   let total3 = 0, total7 = 0, total15 = 0, total30 = 0, totalAll = 0;
-  const byEx = new Map(); // ex -> {p3,p7,p15,p30,pAll}
+  const byEx = new Map(); // ex -> {gross,p3,p7,p15,p30,pAll}
 
   for (let r = 0; r < rows.length; r++) {
     const row = rows[r];
@@ -1685,7 +1797,7 @@ function funding_updatePositionsRollingFundingPnl_3_7_15_30_all() {
       continue;
     }
 
-    const key = `${ex}|${sym}`;
+    const key = `${venueFundingMap.get(ex) || ex}|${sym}`;
     const agg = rollMap.get(key);
 
     const effInterval = (Number.isFinite(intervalS) && intervalS > 0)
@@ -1738,8 +1850,9 @@ function funding_updatePositionsRollingFundingPnl_3_7_15_30_all() {
 
     total3 += pnl3; total7 += pnl7; total15 += pnl15; total30 += pnl30; totalAll += pnlAll;
 
-    if (!byEx.has(ex)) byEx.set(ex, { p3: 0, p7: 0, p15: 0, p30: 0, pAll: 0 });
+    if (!byEx.has(ex)) byEx.set(ex, { gross: 0, p3: 0, p7: 0, p15: 0, p30: 0, pAll: 0 });
     const acc = byEx.get(ex);
+    acc.gross += Math.abs(notional);
     acc.p3 += pnl3; acc.p7 += pnl7; acc.p15 += pnl15; acc.p30 += pnl30; acc.pAll += pnlAll;
   }
 
@@ -1774,11 +1887,14 @@ function funding_buildRollingAvgMapFromHistory_() {
   const historyId = funding_getHistorySpreadsheetId_();
   if (!historyId) throw new Error("history spreadsheet id가 비어있어.");
 
-  const histSS = SpreadsheetApp.openById(historyId);
-  const sh = histSS.getSheetByName(FUNDING_SHEET_HISTORY_8H);
-  if (!sh || sh.getLastRow() < 2) throw new Error("funding_history에 데이터가 없어.");
-
-  const vals = sh.getDataRange().getValues();
+  const vals = funding_withSpreadsheetRetry_("funding_history 읽기", () => {
+    const histSS = SpreadsheetApp.openById(historyId);
+    const sh = histSS.getSheetByName(FUNDING_SHEET_HISTORY_8H);
+    if (!sh || sh.getLastRow() < 2) throw new Error("funding_history에 데이터가 없어.");
+    const lastRow = sh.getLastRow();
+    const lastCol = Math.max(1, Math.min(6, sh.getLastColumn()));
+    return sh.getRange(1, 1, lastRow, lastCol).getValues();
+  }, 4);
   const h = vals[0].map(String);
 
   // header tolerant: timestamp_kst or timestamp (we only need time for filtering)
@@ -1803,6 +1919,7 @@ function funding_buildRollingAvgMapFromHistory_() {
 
   // key -> {sum3,cnt3,sum7,cnt7,sum15,cnt15,sum30,cnt30,sumAll,cntAll, interval_s, firstTs, lastTs}
   const map = new Map();
+  const seen = new Set();
 
   for (let r = 1; r < vals.length; r++) {
     const row = vals[r];
@@ -1821,6 +1938,9 @@ function funding_buildRollingAvgMapFromHistory_() {
     if (isNaN(d.getTime())) continue;
 
     const key = `${ex}|${sym}`;
+    const dedupKey = `${d.getTime()}|${key}`;
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
     let a = map.get(key);
     if (!a) {
       a = {
@@ -1829,6 +1949,7 @@ function funding_buildRollingAvgMapFromHistory_() {
         sum15: 0, cnt15: 0,
         sum30: 0, cnt30: 0,
         sumAll: 0, cntAll: 0,
+        sumSq3: 0, sumSq7: 0, sumSq15: 0, sumSq30: 0, sumSqAll: 0,
         interval_s: interval,
         firstTs: d,
         lastTs: d,
@@ -1843,13 +1964,13 @@ function funding_buildRollingAvgMapFromHistory_() {
     if (d > a.lastTs) a.lastTs = d;
 
     // ALL: always include
-    a.sumAll += rate; a.cntAll += 1;
+    a.sumAll += rate; a.sumSqAll += rate * rate; a.cntAll += 1;
 
     // windowed: only include when within each cut
-    if (d >= cut30) { a.sum30 += rate; a.cnt30 += 1; }
-    if (d >= cut15) { a.sum15 += rate; a.cnt15 += 1; }
-    if (d >= cut7) { a.sum7 += rate; a.cnt7 += 1; }
-    if (d >= cut3) { a.sum3 += rate; a.cnt3 += 1; }
+    if (d >= cut30) { a.sum30 += rate; a.sumSq30 += rate * rate; a.cnt30 += 1; }
+    if (d >= cut15) { a.sum15 += rate; a.sumSq15 += rate * rate; a.cnt15 += 1; }
+    if (d >= cut7) { a.sum7 += rate; a.sumSq7 += rate * rate; a.cnt7 += 1; }
+    if (d >= cut3) { a.sum3 += rate; a.sumSq3 += rate * rate; a.cnt3 += 1; }
   }
 
   return map;
@@ -1911,13 +2032,22 @@ function funding_rollPnlUsd_(notionalUsd, avgRate8h, days, interval_s) {
   return (-Number(notionalUsd) * (Number(avgRate8h) || 0)) * nIntervals;
 }
 
+function funding_pctOfGross_(pnlUsd, grossUsd) {
+  const g = Number(grossUsd) || 0;
+  if (!(g > 0)) return 0;
+  return ((Number(pnlUsd) || 0) / g) * 100;
+}
+
 function funding_writeRollingPnlSummary_(shPos, total3, total7, total15, total30, totalAll, byEx) {
-  const SUMMARY_WIDTH = 7;      // 표시용 폭(여유)
-  const TABLE_WIDTH = 6;        // exchange 테이블 실제 폭
-  const CLEAR_ROWS = 40;
+  funding_relocatePositionsSummaryBlockIfNeeded_(shPos);
+
+  const SUMMARY_WIDTH = FUNDING_ROLLING_SUMMARY_WIDTH; // 표시용 폭(여유)
+  const TABLE_WIDTH = 12;       // exchange 테이블 실제 폭
+  const CLEAR_ROWS = FUNDING_ROLLING_SUMMARY_CLEAR_ROWS;
 
   // ✅ 고정 앵커(매번 같은 위치에 덮어씀)
   const c0 = funding_getRollingSummaryAnchorCol_(shPos);
+  funding_ensureSheetHasCols_(shPos, c0 + SUMMARY_WIDTH - 1);
 
   // Clean accidental duplicate rolling blocks created on the right.
   funding_clearDuplicateRollingSummaryBlocks_(shPos, c0);
@@ -1933,14 +2063,29 @@ function funding_writeRollingPnlSummary_(shPos, total3, total7, total15, total30
   shPos.getRange(6, c0, 1, 2).setValues([["TOTAL All_funding_pnl_ALL", totalAll]]);
 
   shPos.getRange(8, c0, 1, TABLE_WIDTH).setValues([[
-    "exchange", "pnl_3d_usd", "pnl_7d_usd", "pnl_15d_usd", "pnl_30d_usd", "pnl_all_usd"
+    "exchange",
+    "gross_oi_usd",
+    "pnl_3d_usd", "pnl_3d_pct",
+    "pnl_7d_usd", "pnl_7d_pct",
+    "pnl_15d_usd", "pnl_15d_pct",
+    "pnl_30d_usd", "pnl_30d_pct",
+    "pnl_all_usd", "pnl_all_pct"
   ]]);
 
   const out = [];
   const exList = Array.from(byEx.keys()).sort();
   for (const ex of exList) {
     const v = byEx.get(ex);
-    out.push([ex, v.p3 || 0, v.p7 || 0, v.p15 || 0, v.p30 || 0, v.pAll || 0]);
+    const gross = Number(v.gross) || 0;
+    out.push([
+      ex,
+      gross,
+      v.p3 || 0, funding_pctOfGross_(v.p3, gross),
+      v.p7 || 0, funding_pctOfGross_(v.p7, gross),
+      v.p15 || 0, funding_pctOfGross_(v.p15, gross),
+      v.p30 || 0, funding_pctOfGross_(v.p30, gross),
+      v.pAll || 0, funding_pctOfGross_(v.pAll, gross),
+    ]);
   }
 
   if (out.length) {
@@ -2074,11 +2219,16 @@ const OPT_SHEET_TARGETS = "opt_targets";
 const OPT_SHEET_RATES = "opt_rates";
 const OPT_SHEET_SOLUTION = "opt_solution";
 const OPT_SHEET_REBALANCE_COST = "opt_rebalance_cost";
+const OPT_SHEET_VENUES = "opt_venues";
+const OPT_SHEET_ASSETS = "opt_assets";
+const OPT_SHEET_HISTORY_SIGNALS = "opt_history_signals";
+const OPT_SHEET_HISTORY_SOLUTION = "opt_history_solution";
 const OPT_DEFAULT_SLIPPAGE_API_URL = "https://slippage.vercel.app/api/slippage";
 
 // Exchanges / symbols
 const OPT_EXCHANGES = [
   "variational",
+  "variational_2",
   "binance",
   "lighter",
   "hyperliquid",
@@ -2088,11 +2238,35 @@ const OPT_EXCHANGES = [
   "paradex",
   "extended",
 ];
-const OPT_SYMBOLS = ["BTC", "ETH", "SOL", "BNB"];
+const OPT_SYMBOLS = ["BTC", "ETH", "SOL", "BNB", "HYPE"];
+
+const OPT_VENUE_HEADERS = [
+  "venue_id",
+  "funding_exchange",
+  "status",
+  "collect_history",
+  "deposit_usd",
+  "min_gross_oi_usd",
+  "gross_max_mult",
+  "dir_limit_mult",
+  "fee_bps",
+  "slippage_bps",
+  "venue_group",
+];
+
+const OPT_ASSET_HEADERS = [
+  "symbol",
+  "status",
+  "asset_group",
+  "cap_mult",
+  "slippage_qty",
+  "min_history_coverage",
+];
 
 // Default input keys
 const OPT_DEFAULT_INPUTS = [
   ["deposit_variational_usd", 250000],
+  ["deposit_variational_2_usd", 0],
   ["deposit_binance_usd", 600000],
   ["deposit_lighter_usd", 50000],
   ["deposit_hyperliquid_usd", 0],
@@ -2103,8 +2277,11 @@ const OPT_DEFAULT_INPUTS = [
   ["deposit_extended_usd", 0],
 
   ["variational_min_gross_oi_usd", 3000000],
+  ["variational_2_min_gross_oi_usd", 0],
+  ["variational_group_min_gross_oi_usd", 0],
 
   ["variational_dir_limit_mult", 1.0],
+  ["variational_2_dir_limit_mult", 1.0],
   ["binance_dir_limit_mult", 2.0],
   ["lighter_dir_limit_mult", 1.0],
   ["hyperliquid_dir_limit_mult", 1.0],
@@ -2115,6 +2292,7 @@ const OPT_DEFAULT_INPUTS = [
   ["extended_dir_limit_mult", 1.0],
 
   ["variational_fee_bps", 0],
+  ["variational_2_fee_bps", 0],
   ["binance_fee_bps", 0],
   ["lighter_fee_bps", 0],
   ["hyperliquid_fee_bps", 0],
@@ -2125,6 +2303,7 @@ const OPT_DEFAULT_INPUTS = [
   ["extended_fee_bps", 0],
 
   ["variational_slippage_bps", 0],
+  ["variational_2_slippage_bps", 0],
   ["binance_slippage_bps", 0],
   ["lighter_slippage_bps", 0],
   ["hyperliquid_slippage_bps", 0],
@@ -2142,7 +2321,10 @@ const OPT_DEFAULT_INPUTS = [
   ["live_slippage_qty_eth", 0],
   ["live_slippage_qty_sol", 0],
   ["live_slippage_qty_bnb", 0],
+  ["live_slippage_qty_hype", 0],
 
+  ["variational_gross_max_mult", 20.0],
+  ["variational_2_gross_max_mult", 20.0],
   ["binance_gross_max_mult", 5.0],
   ["lighter_gross_max_mult", 5.0],
   ["hyperliquid_gross_max_mult", 5.0],
@@ -2154,9 +2336,22 @@ const OPT_DEFAULT_INPUTS = [
 
   ["sol_cap_mult", 0.8],
   ["bnb_cap_mult", 0.8],
+  ["hype_cap_mult", 0],
+
+  ["historical_horizon_days", 30],
+  ["historical_risk_lambda", 0.25],
+  ["historical_weight_3d", 0.10],
+  ["historical_weight_7d", 0.20],
+  ["historical_weight_15d", 0.25],
+  ["historical_weight_30d", 0.35],
+  ["historical_weight_live", 0.10],
+  ["neutrality_tolerance_pct", 0.01],
+  ["neutrality_tolerance_abs", 100],
+  ["optimizer_solve_seconds", 25],
 
   ["enable_variational_booster", "TRUE"],
   ["booster_step_usd", 50000],
+  ["booster_min_step_usd", 5000],
   ["booster_assets", "BTC,ETH"],
   ["booster_hedge_order", "binance,hyperliquid,lighter,nado,01xyz,pacifica,paradex,extended"],
 ];
@@ -2329,18 +2524,30 @@ function funding_fetchLiveSlippageMapsBatch_(apiEndpoint, reqs) {
 }
 
 function funding_initOptimizerSheets() {
-  funding_initSheets();
+  return funding_withSpreadsheetRetry_(
+    "optimizer 시트 초기화",
+    funding_initOptimizerSheetsOnce_,
+    4
+  );
+}
 
+function funding_initOptimizerSheetsOnce_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const hasCoreSheets = [
+    FUNDING_SHEET_CONFIG,
+    FUNDING_SHEET_CURRENT,
+    FUNDING_SHEET_POSITIONS,
+  ].every((name) => Boolean(ss.getSheetByName(name)));
+
+  // Existing operating workbooks do not need their wide positions/config
+  // sheets initialized again. This also avoids dozens of unnecessary service
+  // calls on large workbooks.
+  if (!hasCoreSheets) funding_initSheets();
 
   const shInputs = funding_initSheet_(ss, OPT_SHEET_INPUTS, ["key", "value"]);
   funding_ensureKeyValues_(shInputs, OPT_DEFAULT_INPUTS);
 
-  const shTargets = funding_initSheet_(ss, OPT_SHEET_TARGETS, ["symbol", "target_qty (from positions)"]);
-  shTargets.getRange(2, 1, OPT_SYMBOLS.length, 1).setValues(OPT_SYMBOLS.map((s) => [s]));
-  shTargets.getRange(2, 2, OPT_SYMBOLS.length, 1).setFormulas(
-    OPT_SYMBOLS.map((_, i) => [`=SUMIF(${FUNDING_SHEET_POSITIONS}!B:B, A${i + 2}, ${FUNDING_SHEET_POSITIONS}!C:C)`])
-  );
+  funding_initSheet_(ss, OPT_SHEET_TARGETS, ["symbol", "target_qty (from positions)"]);
 
   funding_initSheet_(ss, OPT_SHEET_RATES, ["exchange", "symbol", "funding_rate_8h", "mark_price", "asOf"]);
 
@@ -2357,9 +2564,24 @@ function funding_initOptimizerSheets() {
   ]);
   shSol.getRange(2, 1, shSol.getMaxRows() - 1, shSol.getMaxColumns()).clearContent();
 
+  funding_initSheet_(ss, OPT_SHEET_VENUES, OPT_VENUE_HEADERS);
+  funding_initSheet_(ss, OPT_SHEET_ASSETS, OPT_ASSET_HEADERS);
+  funding_initSheet_(ss, OPT_SHEET_HISTORY_SIGNALS, [
+    "funding_exchange", "symbol", "expected_rate_8h", "stddev_8h", "confidence",
+    "history_usable", "avg_3d", "coverage_3d", "avg_7d", "coverage_7d",
+    "avg_15d", "coverage_15d", "avg_30d", "coverage_30d", "live_rate_8h", "source",
+  ]);
+  funding_initSheet_(ss, OPT_SHEET_HISTORY_SOLUTION, [
+    "venue_id", "funding_exchange", "status", "symbol", "current_qty", "final_qty",
+    "trade_qty", "carry_overlay_qty", "mark_price", "expected_rate_8h", "expected_funding_usd",
+    "risk_penalty_usd", "trading_cost_usd", "expected_net_usd", "history_source",
+  ]);
+
+  funding_syncOptimizerRegistry_({ showAlert: false });
+
   try { funding_refreshOptRates_(); } catch (e) {}
 
-  safeAlert_("✅ Optimizer sheets created: opt_inputs / opt_targets / opt_rates / opt_solution");
+  safeAlert_("✅ Optimizer sheets created: opt_inputs / opt_venues / opt_assets / opt_targets / opt_rates / opt_solution");
 }
 
 function funding_refreshOptRates_() {
@@ -2388,8 +2610,6 @@ function funding_refreshOptRates_() {
     const ex = String(row[iEx] || "").toLowerCase().trim();
     const sym = String(row[iSym] || "").toUpperCase().trim();
     if (!ex || !sym) continue;
-    if (!OPT_EXCHANGES.includes(ex)) continue;
-    if (!OPT_SYMBOLS.includes(sym)) continue;
 
     rows.push([ex, sym, Number(row[iRate]) || 0, Number(row[iMark]) || "", row[iAsOf] || ""]);
   }
@@ -2402,7 +2622,7 @@ function funding_refreshOptRates_() {
 /**
  * Optimize
  */
-function funding_optimizeAllocation() {
+function funding_optimizeAllocationLegacy_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const shInputs = ss.getSheetByName(OPT_SHEET_INPUTS);
   const shTargets = ss.getSheetByName(OPT_SHEET_TARGETS);
@@ -2442,6 +2662,7 @@ function funding_optimizeAllocation() {
 
   const boosterEnabled = String(inputs["enable_variational_booster"] || "TRUE").toUpperCase() === "TRUE";
   const boosterStepUsd = Number(inputs["booster_step_usd"] || 50000);
+  const boosterMinStepUsd = Number(inputs["booster_min_step_usd"] || 5000);
   const boosterAssets = String(inputs["booster_assets"] || "BTC,ETH")
     .split(",")
     .map((s) => s.trim().toUpperCase())
@@ -2454,6 +2675,7 @@ function funding_optimizeAllocation() {
   const targetQty = funding_readTargets_(shTargets);
   const rateMap = funding_readRates_(shRates);
   const markFallback = funding_buildMarkFallback_(rateMap);
+  const venueFundingMap = funding_getVenueFundingExchangeMapSafe_(ss);
 
   const alloc = {};
   for (const ex of OPT_EXCHANGES) {
@@ -2535,6 +2757,7 @@ function funding_optimizeAllocation() {
       markFallback,
       minGrossVar,
       boosterStepUsd,
+      boosterMinStepUsd,
       boosterAssets,
       boosterHedgeOrder
     );
@@ -2549,6 +2772,39 @@ function funding_optimizeAllocation() {
       );
     }
   }
+
+  // Improve funding inside the feasible region after min-gross is satisfied.
+  funding_improveAllocationLocal_(
+    alloc,
+    targetQty,
+    dep,
+    dirMult,
+    capMult,
+    grossMaxMult,
+    rateMap,
+    markFallback,
+    minGrossVar,
+    {
+      stepUsd: boosterStepUsd,
+      minStepUsd: boosterMinStepUsd,
+      requireVarMinGross: boosterEnabled && dep.variational > 0 && minGrossVar > 0,
+    }
+  );
+
+  funding_validateAllocationOrThrow_(
+    alloc,
+    targetQty,
+    dep,
+    dirMult,
+    capMult,
+    grossMaxMult,
+    rateMap,
+    markFallback,
+    minGrossVar,
+    {
+      requireVarMinGross: boosterEnabled && dep.variational > 0 && minGrossVar > 0,
+    }
+  );
 
   // ---- Write solution ----
   funding_writeOptSolution_(
@@ -2666,7 +2922,8 @@ function funding_estimateRebalanceTradingCost_(opts) {
     if (!Number.isFinite(deltaQty) || Math.abs(deltaQty) < 1e-12) continue;
 
     const markDirect = Number(tgt.mark);
-    const markRate = Number((rateMap.get(key) || {}).mark);
+    const fundingEx = venueFundingMap.get(ex) || ex;
+    const markRate = Number((rateMap.get(`${fundingEx}|${sym}`) || {}).mark);
     const markFb = Number(markFallback[sym]);
     const mark =
       Number.isFinite(markDirect) && markDirect > 0
@@ -2750,7 +3007,7 @@ function funding_estimateRebalanceTradingCost_(opts) {
       const queryQty = refQty > 0 ? refQty : qtyAbs;
       const liveKey = `${sym}|${funding_round_(queryQty)}|${side}`;
       const liveMap = liveSlippageByKey.get(liveKey) || new Map();
-      const live = liveMap.get(ex);
+      const live = liveMap.get(venueFundingMap.get(ex) || ex);
       if (live) {
         feeBps = Number(live.feeBps || 0);
         slipBps = Number(live.slippageBps || 0);
@@ -3138,6 +3395,196 @@ function funding_round_(x) {
   return Math.round(x * 1e12) / 1e12;
 }
 
+function funding_computeObjective8hUsd_(alloc, rateMap, markFallback) {
+  let total = 0;
+  for (const ex of OPT_EXCHANGES) {
+    for (const sym of OPT_SYMBOLS) {
+      const qty = Number(alloc[ex][sym] || 0);
+      if (!Number.isFinite(qty) || Math.abs(qty) < 1e-12) continue;
+      const it = rateMap.get(`${ex}|${sym}`) || {};
+      const rate = Number(it.rate8h) || 0;
+      const mark = funding_getMark_(ex, sym, rateMap, markFallback);
+      total += (-qty * mark * rate);
+    }
+  }
+  return total;
+}
+
+function funding_checkAllocationConstraints_(
+  alloc,
+  targetQty,
+  dep,
+  dirMult,
+  capMult,
+  grossMaxMult,
+  rateMap,
+  markFallback,
+  minGrossVar,
+  options
+) {
+  const opts = options || {};
+  const requireVarMinGross = opts.requireVarMinGross !== false;
+  const tol = 1e-6;
+  const violations = [];
+
+  for (const sym of OPT_SYMBOLS) {
+    let totalQty = 0;
+    for (const ex of OPT_EXCHANGES) totalQty += Number(alloc[ex][sym] || 0);
+    const tgt = Number(targetQty[sym] || 0);
+    if (Math.abs(totalQty - tgt) > tol) {
+      violations.push(`target mismatch ${sym}: got=${totalQty} expected=${tgt}`);
+    }
+  }
+
+  for (const ex of OPT_EXCHANGES) {
+    const s = funding_calcExchangeStatsFromAlloc_(alloc, ex, rateMap, markFallback);
+    const dirLimit = Number(dep[ex] || 0) * Number(dirMult[ex] || 0);
+    if (Math.abs(s.dir) > dirLimit + tol) {
+      violations.push(`${ex} dir violation: ${s.dir} / limit ${dirLimit}`);
+    }
+
+    const grossMult = Number(grossMaxMult[ex]);
+    const grossMax = ex === "variational" || !Number.isFinite(grossMult) ? null : (Number(dep[ex]) || 0) * grossMult;
+
+    if (ex === "variational") {
+      if (requireVarMinGross && s.gross < Number(minGrossVar || 0) - tol) {
+        violations.push(`${ex} gross violation: ${s.gross} / min ${Number(minGrossVar || 0)}`);
+      }
+    } else if (grossMax != null && s.gross > grossMax + tol) {
+      violations.push(`${ex} gross violation: ${s.gross} / max ${grossMax}`);
+    }
+
+    const solCap = Number(dep[ex] || 0) * Number(capMult.SOL || 0);
+    const bnbCap = Number(dep[ex] || 0) * Number(capMult.BNB || 0);
+    if (s.perSymAbs.SOL > solCap + tol) {
+      violations.push(`${ex} SOL cap violation: ${s.perSymAbs.SOL} / cap ${solCap}`);
+    }
+    if (s.perSymAbs.BNB > bnbCap + tol) {
+      violations.push(`${ex} BNB cap violation: ${s.perSymAbs.BNB} / cap ${bnbCap}`);
+    }
+  }
+
+  return { ok: violations.length === 0, violations };
+}
+
+function funding_validateAllocationOrThrow_(
+  alloc,
+  targetQty,
+  dep,
+  dirMult,
+  capMult,
+  grossMaxMult,
+  rateMap,
+  markFallback,
+  minGrossVar,
+  options
+) {
+  const chk = funding_checkAllocationConstraints_(
+    alloc,
+    targetQty,
+    dep,
+    dirMult,
+    capMult,
+    grossMaxMult,
+    rateMap,
+    markFallback,
+    minGrossVar,
+    options
+  );
+  if (chk.ok) return;
+
+  throw new Error(
+    "Optimize result constraint violation\n" +
+      chk.violations.slice(0, 12).join("\n")
+  );
+}
+
+function funding_improveAllocationLocal_(
+  alloc,
+  targetQty,
+  dep,
+  dirMult,
+  capMult,
+  grossMaxMult,
+  rateMap,
+  markFallback,
+  minGrossVar,
+  options
+) {
+  const opts = options || {};
+  const baseStepUsd = Math.max(1, Number(opts.stepUsd) || 50000);
+  const minStepUsd = Math.max(1, Math.min(baseStepUsd, Number(opts.minStepUsd) || 5000));
+  const requireVarMinGross = opts.requireVarMinGross !== false;
+  const rawSteps = [baseStepUsd, Math.max(minStepUsd, baseStepUsd / 4), minStepUsd];
+  const stepUsds = Array.from(new Set(rawSteps.map((x) => Math.max(1, funding_round_(x))))).sort((a, b) => b - a);
+
+  let currentObjective = funding_computeObjective8hUsd_(alloc, rateMap, markFallback);
+  const maxIter = 80;
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    let best = null;
+
+    for (const sym of OPT_SYMBOLS) {
+      for (const src of OPT_EXCHANGES) {
+        for (const dst of OPT_EXCHANGES) {
+          if (src === dst) continue;
+
+          const srcMark = funding_getMark_(src, sym, rateMap, markFallback);
+          const dstMark = funding_getMark_(dst, sym, rateMap, markFallback);
+          const refMark = ((Number(srcMark) || 0) + (Number(dstMark) || 0)) / 2;
+          if (!(refMark > 0)) continue;
+
+          for (const stepUsd of stepUsds) {
+            const qtyStep = funding_round_(stepUsd / refMark);
+            if (!(qtyStep > 0)) continue;
+
+            for (const sign of [1, -1]) {
+              const dq = qtyStep * sign;
+              const prevSrc = Number(alloc[src][sym] || 0);
+              const prevDst = Number(alloc[dst][sym] || 0);
+
+              alloc[src][sym] = funding_round_(prevSrc - dq);
+              alloc[dst][sym] = funding_round_(prevDst + dq);
+
+              const chk = funding_checkAllocationConstraints_(
+                alloc,
+                targetQty,
+                dep,
+                dirMult,
+                capMult,
+                grossMaxMult,
+                rateMap,
+                markFallback,
+                minGrossVar,
+                { requireVarMinGross }
+              );
+
+              if (chk.ok) {
+                const nextObjective = funding_computeObjective8hUsd_(alloc, rateMap, markFallback);
+                const improvement = nextObjective - currentObjective;
+                if (improvement > 1e-6) {
+                  if (!best || improvement > best.improvement + 1e-6) {
+                    best = { src, dst, sym, dq, improvement };
+                  }
+                }
+              }
+
+              alloc[src][sym] = prevSrc;
+              alloc[dst][sym] = prevDst;
+            }
+          }
+        }
+      }
+    }
+
+    if (!best) break;
+
+    alloc[best.src][best.sym] = funding_round_(Number(alloc[best.src][best.sym] || 0) - best.dq);
+    alloc[best.dst][best.sym] = funding_round_(Number(alloc[best.dst][best.sym] || 0) + best.dq);
+    currentObjective += best.improvement;
+  }
+}
+
 /* =========================
  * Booster
  * ========================= */
@@ -3170,6 +3617,7 @@ function funding_applyVariationalBooster_(
   markFallback,
   minGrossVar,
   stepUsd,
+  minStepUsdInput,
   assets,
   hedgeOrder
 ) {
@@ -3181,6 +3629,11 @@ function funding_applyVariationalBooster_(
 
   if (!Number.isFinite(minGrossVar) || minGrossVar <= 0) return;
   if (!Number.isFinite(stepUsd) || stepUsd <= 0) throw new Error("booster_step_usd가 0이거나 비정상");
+  let minStepUsd = Number(minStepUsdInput);
+  if (!Number.isFinite(minStepUsd) || minStepUsd <= 0) {
+    minStepUsd = Math.min(stepUsd, 5000);
+  }
+  minStepUsd = Math.min(minStepUsd, stepUsd);
 
   if (stats.variational.gross >= minGrossVar - 1e-6) return;
 
@@ -3215,6 +3668,166 @@ function funding_applyVariationalBooster_(
     return Number(it.rate8h) || 0;
   }
 
+  function findBestCandidateForBlock_(blockUsd) {
+    let best = null;
+
+    for (const hedgeEx0 of hedgeOrder || []) {
+      const hedgeEx = String(hedgeEx0 || "").toLowerCase().trim();
+      if (!OPT_EXCHANGES.includes(hedgeEx)) continue;
+      if (hedgeEx === "variational") continue;
+
+      const hedgeGrossMax = Number(grossMaxByEx[hedgeEx]);
+      const reserve = hedgeEx === "lighter" ? lighterReserveGross : 0;
+      const safeMax = Number.isFinite(hedgeGrossMax) ? (hedgeGrossMax - reserve) : Infinity;
+
+      for (let i = 0; i < pool.length; i++) {
+        for (let j = i + 1; j < pool.length; j++) {
+          const a = pool[i];
+          const b = pool[j];
+
+          const checkCaps = (symShortOnVar, symLongOnVar) => {
+            const mvS = funding_getMark_("variational", symShortOnVar, rateMap, markFallback);
+            const mvL = funding_getMark_("variational", symLongOnVar, rateMap, markFallback);
+            const mhS = funding_getMark_(hedgeEx, symShortOnVar, rateMap, markFallback);
+            const mhL = funding_getMark_(hedgeEx, symLongOnVar, rateMap, markFallback);
+            if (!(mvS > 0 && mvL > 0 && mhS > 0 && mhL > 0)) return { ok: false };
+
+            // Preserve per-symbol total qty across exchanges.
+            const dqVarS = -blockUsd / mvS;
+            const dqVarL = +blockUsd / mvL;
+            const dqHedS = -dqVarS;
+            const dqHedL = -dqVarL;
+
+            const capVarS = capUsd("variational", symShortOnVar);
+            const capVarL = capUsd("variational", symLongOnVar);
+            const capHedS = capUsd(hedgeEx, symShortOnVar);
+            const capHedL = capUsd(hedgeEx, symLongOnVar);
+
+            const curVarAbsS = Math.abs(Number(alloc.variational[symShortOnVar] || 0) * mvS);
+            const curVarAbsL = Math.abs(Number(alloc.variational[symLongOnVar] || 0) * mvL);
+            const curHedAbsS = Math.abs(Number(alloc[hedgeEx][symShortOnVar] || 0) * mhS);
+            const curHedAbsL = Math.abs(Number(alloc[hedgeEx][symLongOnVar] || 0) * mhL);
+
+            const nextVarQtyS = Number(alloc.variational[symShortOnVar] || 0) + dqVarS;
+            const nextVarQtyL = Number(alloc.variational[symLongOnVar] || 0) + dqVarL;
+            const nextHedQtyS = Number(alloc[hedgeEx][symShortOnVar] || 0) + dqHedS;
+            const nextHedQtyL = Number(alloc[hedgeEx][symLongOnVar] || 0) + dqHedL;
+
+            const nextVarAbsS = Math.abs(nextVarQtyS * mvS);
+            const nextVarAbsL = Math.abs(nextVarQtyL * mvL);
+            const nextHedAbsS = Math.abs(nextHedQtyS * mhS);
+            const nextHedAbsL = Math.abs(nextHedQtyL * mhL);
+
+            if (nextVarAbsS > capVarS + 1e-6) return { ok: false };
+            if (nextVarAbsL > capVarL + 1e-6) return { ok: false };
+            if (nextHedAbsS > capHedS + 1e-6) return { ok: false };
+            if (nextHedAbsL > capHedL + 1e-6) return { ok: false };
+
+            // exact gross update (netting-aware), not conservative +2*block
+            const nextVarGross =
+              Number(stats.variational.gross || 0) -
+              (curVarAbsS + curVarAbsL) +
+              (nextVarAbsS + nextVarAbsL);
+
+            const nextHedGross =
+              Number(stats[hedgeEx].gross || 0) -
+              (curHedAbsS + curHedAbsL) +
+              (nextHedAbsS + nextHedAbsL);
+
+            if (Number.isFinite(safeMax) && nextHedGross > safeMax + 1e-6) {
+              return { ok: false };
+            }
+
+            const varGain = nextVarGross - Number(stats.variational.gross || 0);
+            const hedgeGain = nextHedGross - Number(stats[hedgeEx].gross || 0);
+            if (!(varGain > 1e-9)) return { ok: false };
+
+            const deltaPnl8h =
+              -(dqVarS * mvS * rate8h("variational", symShortOnVar)) -
+              (dqVarL * mvL * rate8h("variational", symLongOnVar)) -
+              (dqHedS * mhS * rate8h(hedgeEx, symShortOnVar)) -
+              (dqHedL * mhL * rate8h(hedgeEx, symLongOnVar));
+
+            return {
+              ok: true,
+              varGain,
+              hedgeGain,
+              deltaPnl8h,
+              // hedgeGain <= 0 는 오히려 유리(헤지 gross를 안 쓰거나 줄임)
+              efficiency: hedgeGain > 1e-9 ? (varGain / hedgeGain) : Number.POSITIVE_INFINITY,
+            };
+          };
+
+          const chk1 = checkCaps(a, b);
+          if (chk1.ok) {
+            const cand = {
+              hedgeEx,
+              symShortOnVar: a,
+              symLongOnVar: b,
+              varGain: chk1.varGain,
+              hedgeGain: chk1.hedgeGain,
+              deltaPnl8h: chk1.deltaPnl8h,
+              efficiency: chk1.efficiency,
+            };
+            if (
+              !best ||
+              cand.varGain > best.varGain + 1e-9 ||
+              (Math.abs(cand.varGain - best.varGain) <= 1e-9 && cand.hedgeGain < best.hedgeGain - 1e-9) ||
+              (Math.abs(cand.varGain - best.varGain) <= 1e-9 &&
+                Math.abs(cand.hedgeGain - best.hedgeGain) <= 1e-9 &&
+                cand.efficiency > best.efficiency + 1e-12) ||
+              (Math.abs(cand.varGain - best.varGain) <= 1e-9 &&
+                Math.abs(cand.hedgeGain - best.hedgeGain) <= 1e-9 &&
+                Math.abs(cand.efficiency - best.efficiency) <= 1e-12 &&
+                cand.deltaPnl8h > best.deltaPnl8h + 1e-9) ||
+              (Math.abs(cand.varGain - best.varGain) <= 1e-9 &&
+                Math.abs(cand.hedgeGain - best.hedgeGain) <= 1e-9 &&
+                Math.abs(cand.efficiency - best.efficiency) <= 1e-12 &&
+                Math.abs(cand.deltaPnl8h - best.deltaPnl8h) <= 1e-9 &&
+                (hedgeRank[cand.hedgeEx] ?? 999) < (hedgeRank[best.hedgeEx] ?? 999))
+            ) {
+              best = cand;
+            }
+          }
+
+          const chk2 = checkCaps(b, a);
+          if (chk2.ok) {
+            const cand = {
+              hedgeEx,
+              symShortOnVar: b,
+              symLongOnVar: a,
+              varGain: chk2.varGain,
+              hedgeGain: chk2.hedgeGain,
+              deltaPnl8h: chk2.deltaPnl8h,
+              efficiency: chk2.efficiency,
+            };
+            if (
+              !best ||
+              cand.varGain > best.varGain + 1e-9 ||
+              (Math.abs(cand.varGain - best.varGain) <= 1e-9 && cand.hedgeGain < best.hedgeGain - 1e-9) ||
+              (Math.abs(cand.varGain - best.varGain) <= 1e-9 &&
+                Math.abs(cand.hedgeGain - best.hedgeGain) <= 1e-9 &&
+                cand.efficiency > best.efficiency + 1e-12) ||
+              (Math.abs(cand.varGain - best.varGain) <= 1e-9 &&
+                Math.abs(cand.hedgeGain - best.hedgeGain) <= 1e-9 &&
+                Math.abs(cand.efficiency - best.efficiency) <= 1e-12 &&
+                cand.deltaPnl8h > best.deltaPnl8h + 1e-9) ||
+              (Math.abs(cand.varGain - best.varGain) <= 1e-9 &&
+                Math.abs(cand.hedgeGain - best.hedgeGain) <= 1e-9 &&
+                Math.abs(cand.efficiency - best.efficiency) <= 1e-12 &&
+                Math.abs(cand.deltaPnl8h - best.deltaPnl8h) <= 1e-9 &&
+                (hedgeRank[cand.hedgeEx] ?? 999) < (hedgeRank[best.hedgeEx] ?? 999))
+            ) {
+              best = cand;
+            }
+          }
+        }
+      }
+    }
+
+    return best;
+  }
+
   function applyBlock(hedgeEx, symShortOnVar, symLongOnVar, blockUsd) {
     const mvS = funding_getMark_("variational", symShortOnVar, rateMap, markFallback);
     const mvL = funding_getMark_("variational", symLongOnVar, rateMap, markFallback);
@@ -3225,11 +3838,11 @@ function funding_applyVariationalBooster_(
       throw new Error("booster mark_price 누락. funding_current/opt_rates 확인 필요");
     }
 
-    // deltas (USD notional = blockUsd)
+    // Deltas preserve total qty per symbol across exchanges.
     const dqVarS = -blockUsd / mvS; // var short
     const dqVarL = +blockUsd / mvL; // var long
-    const dqHedS = +blockUsd / mhS; // hedge long
-    const dqHedL = -blockUsd / mhL; // hedge short
+    const dqHedS = -dqVarS;         // hedge long, same qty
+    const dqHedL = -dqVarL;         // hedge short, same qty
 
     // --- BEFORE abs/signed notionals (정확한 gross/dir 변화량 계산) ---
     const prevVarQtyS = Number(alloc.variational[symShortOnVar] || 0);
@@ -3285,82 +3898,39 @@ function funding_applyVariationalBooster_(
     iter++;
 
     const remainingGross = minGrossVar - stats.variational.gross;
-    let blockUsd = Math.min(stepUsd, remainingGross / 2);
-    if (!Number.isFinite(blockUsd) || blockUsd <= 0) break;
+    const baseBlockUsd = Math.min(stepUsd, remainingGross / 2);
+    if (!Number.isFinite(baseBlockUsd) || baseBlockUsd <= 0) break;
 
+    let blockUsd = baseBlockUsd;
     let best = null;
-
-    for (const hedgeEx0 of hedgeOrder || []) {
-      const hedgeEx = String(hedgeEx0 || "").toLowerCase().trim();
-      if (!OPT_EXCHANGES.includes(hedgeEx)) continue;
-      if (hedgeEx === "variational") continue;
-
-      const hedgeGrossMax = Number(grossMaxByEx[hedgeEx]);
-      if (Number.isFinite(hedgeGrossMax)) {
-        const reserve = hedgeEx === "lighter" ? lighterReserveGross : 0;
-        const after = Number(stats[hedgeEx].gross || 0) + 2 * blockUsd; // 후보 필터는 보수적으로 유지
-        const safeMax = hedgeGrossMax - reserve;
-        if (after > safeMax + 1e-6) continue;
-      }
-
-      for (let i = 0; i < pool.length; i++) {
-        for (let j = i + 1; j < pool.length; j++) {
-          const a = pool[i];
-          const b = pool[j];
-
-          const checkCaps = (symShortOnVar, symLongOnVar) => {
-            const mvS = funding_getMark_("variational", symShortOnVar, rateMap, markFallback);
-            const mvL = funding_getMark_("variational", symLongOnVar, rateMap, markFallback);
-            const mhS = funding_getMark_(hedgeEx, symShortOnVar, rateMap, markFallback);
-            const mhL = funding_getMark_(hedgeEx, symLongOnVar, rateMap, markFallback);
-            if (!(mvS > 0 && mvL > 0 && mhS > 0 && mhL > 0)) return false;
-
-            const capVarS = capUsd("variational", symShortOnVar);
-            const capVarL = capUsd("variational", symLongOnVar);
-            const capHedS = capUsd(hedgeEx, symShortOnVar);
-            const capHedL = capUsd(hedgeEx, symLongOnVar);
-
-            const nextVarAbsS = Math.abs((Number(alloc.variational[symShortOnVar] || 0) + -blockUsd / mvS) * mvS);
-            const nextVarAbsL = Math.abs((Number(alloc.variational[symLongOnVar] || 0) + +blockUsd / mvL) * mvL);
-            const nextHedAbsS = Math.abs((Number(alloc[hedgeEx][symShortOnVar] || 0) + +blockUsd / mhS) * mhS);
-            const nextHedAbsL = Math.abs((Number(alloc[hedgeEx][symLongOnVar] || 0) + -blockUsd / mhL) * mhL);
-
-            if (nextVarAbsS > capVarS + 1e-6) return false;
-            if (nextVarAbsL > capVarL + 1e-6) return false;
-            if (nextHedAbsS > capHedS + 1e-6) return false;
-            if (nextHedAbsL > capHedL + 1e-6) return false;
-            return true;
-          };
-
-          const pnl1 = rate8h("variational", a) - rate8h(hedgeEx, a) + (rate8h(hedgeEx, b) - rate8h("variational", b));
-          const pnl2 = rate8h("variational", b) - rate8h(hedgeEx, b) + (rate8h(hedgeEx, a) - rate8h("variational", a));
-
-          if (checkCaps(a, b)) {
-            const cand = { hedgeEx, symShortOnVar: a, symLongOnVar: b, pnlPerUsd: pnl1 };
-            if (!best || cand.pnlPerUsd > best.pnlPerUsd + 1e-15) best = cand;
-            else if (Math.abs(cand.pnlPerUsd - best.pnlPerUsd) <= 1e-15) {
-              if ((hedgeRank[cand.hedgeEx] ?? 999) < (hedgeRank[best.hedgeEx] ?? 999)) best = cand;
-            }
-          }
-          if (checkCaps(b, a)) {
-            const cand = { hedgeEx, symShortOnVar: b, symLongOnVar: a, pnlPerUsd: pnl2 };
-            if (!best || cand.pnlPerUsd > best.pnlPerUsd + 1e-15) best = cand;
-            else if (Math.abs(cand.pnlPerUsd - best.pnlPerUsd) <= 1e-15) {
-              if ((hedgeRank[cand.hedgeEx] ?? 999) < (hedgeRank[best.hedgeEx] ?? 999)) best = cand;
-            }
-          }
-        }
-      }
+    while (blockUsd >= minStepUsd - 1e-9) {
+      best = findBestCandidateForBlock_(blockUsd);
+      if (best) break;
+      blockUsd /= 2;
     }
 
     if (!best) {
-      const safeMax = ligGrossMax - lighterReserveGross;
+      const diags = [];
+      for (const hedgeEx0 of hedgeOrder || []) {
+        const hedgeEx = String(hedgeEx0 || "").toLowerCase().trim();
+        if (!OPT_EXCHANGES.includes(hedgeEx) || hedgeEx === "variational") continue;
+
+        const hedgeGross = Number(stats[hedgeEx]?.gross || 0);
+        const hedgeGrossMax = Number(grossMaxByEx[hedgeEx]);
+        const reserve = hedgeEx === "lighter" ? lighterReserveGross : 0;
+        const safeMax = Number.isFinite(hedgeGrossMax) ? (hedgeGrossMax - reserve) : Infinity;
+        const headroom = Number.isFinite(safeMax) ? (safeMax - hedgeGross) : Infinity;
+        diags.push(
+          `${hedgeEx}: gross=${hedgeGross.toFixed(2)} / safeMax=${Number.isFinite(safeMax) ? safeMax.toFixed(2) : "INF"} / headroom=${Number.isFinite(headroom) ? headroom.toFixed(2) : "INF"}`
+        );
+      }
       throw new Error(
         `Variational min gross OI를 더 이상 채울 수 없어.\n` +
           `현재 var gross=${stats.variational.gross.toFixed(2)} / min=${minGrossVar.toFixed(2)}\n` +
-          `lighter gross=${stats.lighter.gross.toFixed(2)} / safeMax=${(safeMax > 0 ? safeMax : 0).toFixed(2)} (reserve=${lighterReserveGross.toFixed(2)})\n` +
-          `가능 원인: SOL/BNB cap 제한, hedge 거래소 gross_max 제한, hedge_order 후보 부족, mark/rate 누락.\n` +
-          `해결: booster_assets(BTC,ETH) 유지 / hedge_order 확장 / sol_cap_mult·bnb_cap_mult 완화 / 각 거래소 *_gross_max_mult 상향`
+          `시도 블록: step=${stepUsd.toFixed(2)} / min_step=${minStepUsd.toFixed(2)} / 마지막 시도=${baseBlockUsd.toFixed(2)}\n` +
+          `hedge 상태:\n- ${diags.join("\n- ")}\n` +
+          `가능 원인: mark/rate 누락, hedge 거래소 gross_max 제한, hedge_order 후보 부족.\n` +
+          `해결: booster_step_usd/booster_min_step_usd 하향, hedge_order 확장, 각 거래소 *_gross_max_mult 상향`
       );
     }
 
@@ -3519,10 +4089,15 @@ function funding_ensureKeyValues_(sh, kvPairs) {
     if (k) idxByKey.set(k, i + 1);
   }
 
+  const missing = [];
   for (const [k, v] of kvPairs) {
-    const row = idxByKey.get(k);
-    if (row) continue; // user value 유지
-    sh.getRange(sh.getLastRow() + 1, 1, 1, 2).setValues([[k, v]]);
+    if (idxByKey.has(k)) continue; // user value 유지
+    missing.push([k, v]);
+  }
+
+  if (missing.length) {
+    const startRow = Math.max(2, sh.getLastRow() + 1);
+    sh.getRange(startRow, 1, missing.length, 2).setValues(missing);
   }
 }
 
@@ -3600,6 +4175,7 @@ function funding_updateOptSolutionRollingFundingPnl_3_7_15_30_all() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName("opt_solution");
   if (!sh) throw new Error("opt_solution 시트를 찾을 수 없어. (Funding → Init optimizer sheets 먼저)");
+  const venueFundingMap = funding_getVenueFundingExchangeMapSafe_(ss);
 
   const lastRow = sh.getLastRow();
   if (lastRow < 2) throw new Error("opt_solution에 데이터가 없어. 먼저 Optimize allocation 실행해줘.");
@@ -3626,22 +4202,25 @@ function funding_updateOptSolutionRollingFundingPnl_3_7_15_30_all() {
   // opt_solution은 TOTAL 행이 있으니, 그 전까지만 포지션으로 취급
   // (exchange 컬럼이 "TOTAL"인 줄은 스킵)
   let total3 = 0, total7 = 0, total15 = 0, total30 = 0, totalAll = 0;
-  const byEx = new Map(); // ex -> {p3,p7,p15,p30,pAll}
+  const byEx = new Map(); // ex -> {gross,p3,p7,p15,p30,pAll}
 
   for (let r = 1; r < vals.length; r++) {
     const row = vals[r];
 
     const exRaw = String(row[iEx] || "").trim();
-    if (!exRaw || exRaw.toUpperCase() === "TOTAL") continue;
+    if (!exRaw) continue;
+    if (exRaw.toUpperCase() === "TOTAL") break;
 
     const ex = exRaw.toLowerCase();
     const sym = String(row[iSym] || "").trim().toUpperCase();
     const qty = Number(row[iQty]);
     const mark = Number(row[iMark]);
 
+    if (!OPT_EXCHANGES.includes(ex)) continue;
+    if (!OPT_SYMBOLS.includes(sym)) continue;
     if (!ex || !sym || !Number.isFinite(qty) || qty === 0 || !Number.isFinite(mark) || mark <= 0) continue;
 
-    const key = `${ex}|${sym}`;
+    const key = `${venueFundingMap.get(ex) || ex}|${sym}`;
     const agg = rollMap.get(key);
 
     // interval은 history에 있으면 그거, 없으면 8h 기본값
@@ -3662,15 +4241,17 @@ function funding_updateOptSolutionRollingFundingPnl_3_7_15_30_all() {
 
     total3 += pnl3; total7 += pnl7; total15 += pnl15; total30 += pnl30; totalAll += pnlAll;
 
-    if (!byEx.has(ex)) byEx.set(ex, { p3: 0, p7: 0, p15: 0, p30: 0, pAll: 0 });
+    if (!byEx.has(ex)) byEx.set(ex, { gross: 0, p3: 0, p7: 0, p15: 0, p30: 0, pAll: 0 });
     const acc = byEx.get(ex);
+    acc.gross += Math.abs(notional);
     acc.p3 += pnl3; acc.p7 += pnl7; acc.p15 += pnl15; acc.p30 += pnl30; acc.pAll += pnlAll;
   }
 
   // ===== opt_solution 오른쪽 고정 박스에 요약 출력 (항상 같은 위치 덮어쓰기) =====
   const c0 = funding_getOptRollingSummaryAnchorCol_(sh);
   const CLEAR_ROWS = 30;
-  const WIDTH = 7;
+  const WIDTH = 13;
+  funding_ensureSheetHasCols_(sh, c0 + WIDTH - 1);
 
   // 기존에 오른쪽으로 밀려 생성된 중복 박스는 자동 정리
   funding_clearDuplicateOptRollingBlocks_(sh, c0);
@@ -3683,17 +4264,32 @@ function funding_updateOptSolutionRollingFundingPnl_3_7_15_30_all() {
   sh.getRange(5, c0, 1, 2).setValues([["TOTAL opt_funding_pnl_30d", total30]]);
   sh.getRange(6, c0, 1, 2).setValues([["TOTAL opt_funding_pnl_all", totalAll]]);
 
-  sh.getRange(8, c0, 1, 6).setValues([[
-    "exchange", "pnl_3d_usd", "pnl_7d_usd", "pnl_15d_usd", "pnl_30d_usd", "pnl_all_usd"
+  sh.getRange(8, c0, 1, 12).setValues([[
+    "exchange",
+    "gross_oi_usd",
+    "pnl_3d_usd", "pnl_3d_pct",
+    "pnl_7d_usd", "pnl_7d_pct",
+    "pnl_15d_usd", "pnl_15d_pct",
+    "pnl_30d_usd", "pnl_30d_pct",
+    "pnl_all_usd", "pnl_all_pct"
   ]]);
 
   const out = [];
   const exList = Array.from(byEx.keys()).sort();
   for (const ex of exList) {
     const v = byEx.get(ex);
-    out.push([ex, v.p3 || 0, v.p7 || 0, v.p15 || 0, v.p30 || 0, v.pAll || 0]);
+    const gross = Number(v.gross) || 0;
+    out.push([
+      ex,
+      gross,
+      v.p3 || 0, funding_pctOfGross_(v.p3, gross),
+      v.p7 || 0, funding_pctOfGross_(v.p7, gross),
+      v.p15 || 0, funding_pctOfGross_(v.p15, gross),
+      v.p30 || 0, funding_pctOfGross_(v.p30, gross),
+      v.pAll || 0, funding_pctOfGross_(v.pAll, gross),
+    ]);
   }
-  if (out.length) sh.getRange(9, c0, out.length, 6).setValues(out);
+  if (out.length) sh.getRange(9, c0, out.length, 12).setValues(out);
 
   safeAlert_(
 `✅ OPT rolling funding_pnl 완료 (3/7/15/30 + ALL)
@@ -3703,4 +4299,1205 @@ TOTAL 15d: ${funding_fmtUsd_(total15)}
 TOTAL 30d: ${funding_fmtUsd_(total30)}
 TOTAL ALL: ${funding_fmtUsd_(totalAll)}`
   );
+}
+
+function funding_rollWindowStatsRaw_(sum, cnt, days, interval_s) {
+  const interval = Number(interval_s) || 28800;
+  const safeCnt = Number(cnt) || 0;
+  const safeSum = Number(sum) || 0;
+  const expected = Math.max(1, Math.round((Number(days) * 86400) / interval));
+  const coverage = safeCnt > 0 ? (safeCnt / expected) : 0;
+  const avg = safeCnt > 0 ? (safeSum / safeCnt) : 0;
+  return { sum: safeSum, avg, cnt: safeCnt, coverage };
+}
+
+function funding_compareExchangeSymbolKey_(ka, kb) {
+  const [exA = "", symA = ""] = String(ka || "").split("|");
+  const [exB = "", symB = ""] = String(kb || "").split("|");
+  const ea = EX_ORDER[exA] ?? 999;
+  const eb = EX_ORDER[exB] ?? 999;
+  if (ea !== eb) return ea - eb;
+  if (exA !== exB) return exA.localeCompare(exB);
+  return symA.localeCompare(symB);
+}
+
+/**
+ * 거래소 x 페어 누적 펀딩 요약 (3/7/15/30/all)
+ * - source: funding_history (history spreadsheet)
+ * - output: funding_summary sheet (history spreadsheet)
+ * - metrics are cumulative/average funding rates (position size not applied)
+ */
+function funding_updateExchangePairCumulativeFunding_3_7_15_30_all() {
+  const rollMap = funding_buildRollingAvgMapFromHistory_();
+  const historyId = funding_getHistorySpreadsheetId_();
+  if (!historyId) throw new Error("history spreadsheet id가 비어있어.");
+
+  const histSS = SpreadsheetApp.openById(historyId);
+  const sh = histSS.getSheetByName(FUNDING_SHEET_SUMMARY) || histSS.insertSheet(FUNDING_SHEET_SUMMARY);
+
+  const headers = [
+    "as_of_kst", "exchange", "symbol", "interval_s",
+    "sum_rate_3d", "sum_pct_3d", "avg_rate_3d", "avg_pct_3d", "cnt_3d", "coverage_3d",
+    "sum_rate_7d", "sum_pct_7d", "avg_rate_7d", "avg_pct_7d", "cnt_7d", "coverage_7d",
+    "sum_rate_15d", "sum_pct_15d", "avg_rate_15d", "avg_pct_15d", "cnt_15d", "coverage_15d",
+    "sum_rate_30d", "sum_pct_30d", "avg_rate_30d", "avg_pct_30d", "cnt_30d", "coverage_30d",
+    "sum_rate_all", "sum_pct_all", "avg_rate_all", "avg_pct_all", "cnt_all", "coverage_all",
+    "first_ts", "last_ts"
+  ];
+
+  const runTs = funding_nowKstIso_();
+  const keys = Array.from(rollMap.keys()).sort(funding_compareExchangeSymbolKey_);
+  const rows = [];
+
+  for (const key of keys) {
+    const [exchange, symbol] = key.split("|");
+    const agg = rollMap.get(key);
+    if (!agg) continue;
+
+    const intervalS = Number(agg.interval_s) || 28800;
+
+    const w3 = funding_rollWindowStatsRaw_(agg.sum3, agg.cnt3, 3, intervalS);
+    const w7 = funding_rollWindowStatsRaw_(agg.sum7, agg.cnt7, 7, intervalS);
+    const w15 = funding_rollWindowStatsRaw_(agg.sum15, agg.cnt15, 15, intervalS);
+    const w30 = funding_rollWindowStatsRaw_(agg.sum30, agg.cnt30, 30, intervalS);
+    const allMeta = funding_rollPickAvgAll_(agg, intervalS);
+    const sumAll = Number(agg.sumAll) || 0;
+    const avgAll = Number(allMeta.avg) || 0;
+    const cntAll = Number(allMeta.cnt) || 0;
+    const covAll = Number(allMeta.coverage) || 0;
+
+    const firstTs = agg.firstTs ? funding_toKstIsoFromAny_(agg.firstTs) : "";
+    const lastTs = agg.lastTs ? funding_toKstIsoFromAny_(agg.lastTs) : "";
+
+    rows.push([
+      runTs, exchange, symbol, intervalS,
+
+      w3.sum, w3.sum * 100, w3.avg, w3.avg * 100, w3.cnt, w3.coverage,
+      w7.sum, w7.sum * 100, w7.avg, w7.avg * 100, w7.cnt, w7.coverage,
+      w15.sum, w15.sum * 100, w15.avg, w15.avg * 100, w15.cnt, w15.coverage,
+      w30.sum, w30.sum * 100, w30.avg, w30.avg * 100, w30.cnt, w30.coverage,
+      sumAll, sumAll * 100, avgAll, avgAll * 100, cntAll, covAll,
+      firstTs, lastTs
+    ]);
+  }
+
+  if (sh.getMaxColumns() < headers.length) {
+    sh.insertColumnsAfter(sh.getMaxColumns(), headers.length - sh.getMaxColumns());
+  }
+
+  sh.clearContents();
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  }
+
+  safeAlert_(
+    "누적 펀딩 요약 완료\n" +
+      "sheet: " + histSS.getName() + " / " + FUNDING_SHEET_SUMMARY + "\n" +
+      "rows: " + rows.length + "\n" +
+      "asOf: " + runTs
+  );
+}
+
+/**
+ * Variational 펀딩 히스토리 전용 보기
+ * - current scaling: latest 8h rate -> 1h/8h/1d/1M/1Y
+ * - historical cumulative: 1d/3d/7d/15d/30d/all
+ * - full history matrix: timestamp x configured TARGETS
+ */
+function funding_updateVariationalFundingHistoryView() {
+  const historyId = funding_getHistorySpreadsheetId_();
+  if (!historyId) throw new Error("history spreadsheet id가 비어있어.");
+
+  const histSS = SpreadsheetApp.openById(historyId);
+  const shHistory = histSS.getSheetByName(FUNDING_SHEET_HISTORY_8H);
+  if (!shHistory || shHistory.getLastRow() < 2) {
+    throw new Error("funding_history에 데이터가 없어.");
+  }
+
+  const values = shHistory.getDataRange().getValues();
+  const header = values[0].map((v) => String(v || "").trim());
+  let iTs = header.indexOf("timestamp_kst");
+  if (iTs < 0) iTs = header.indexOf("timestamp");
+  if (iTs < 0) iTs = 0;
+
+  const iEx = header.indexOf("exchange");
+  const iSym = header.indexOf("symbol");
+  const iRate = header.indexOf("funding_rate_8h");
+  const iInterval = header.indexOf("interval_s");
+  if ([iEx, iSym, iRate].some((i) => i < 0)) {
+    throw new Error("funding_history 헤더에 exchange/symbol/funding_rate_8h가 필요해.");
+  }
+
+  // Exact duplicate rows are collapsed so a migrated snapshot is not counted twice.
+  const recordByKey = new Map();
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const exchange = String(row[iEx] || "").trim().toLowerCase();
+    const symbol = String(row[iSym] || "").trim().toUpperCase();
+    const rate8h = Number(row[iRate]);
+    if (exchange !== "variational" || !TARGETS.includes(symbol) || !Number.isFinite(rate8h)) continue;
+
+    const tsRaw = row[iTs];
+    const d = Object.prototype.toString.call(tsRaw) === "[object Date]" && !isNaN(tsRaw.getTime())
+      ? tsRaw
+      : new Date(String(tsRaw || "").trim());
+    if (isNaN(d.getTime())) continue;
+
+    const intervalS = Number(row[iInterval]) || 28800;
+    recordByKey.set(`${d.getTime()}|${symbol}`, {
+      symbol,
+      rate8h,
+      intervalS,
+      time: d,
+      timestampKst: funding_toKstIsoFromAny_(d),
+    });
+  }
+
+  if (!recordByKey.size) {
+    throw new Error("funding_history에서 Variational 대상 심볼 기록을 찾지 못했어.");
+  }
+
+  const recordsBySymbol = new Map(TARGETS.map((symbol) => [symbol, []]));
+  const timeline = new Map();
+  let latestMs = 0;
+
+  for (const rec of recordByKey.values()) {
+    recordsBySymbol.get(rec.symbol).push(rec);
+    const ms = rec.time.getTime();
+    if (ms > latestMs) latestMs = ms;
+
+    if (!timeline.has(ms)) {
+      timeline.set(ms, { timestampKst: rec.timestampKst, rates: {} });
+    }
+    timeline.get(ms).rates[rec.symbol] = rec.rate8h;
+  }
+
+  for (const records of recordsBySymbol.values()) {
+    records.sort((a, b) => a.time.getTime() - b.time.getTime());
+  }
+
+  const sumSince = (records, days) => {
+    if (!records.length) return 0;
+    const cutMs = latestMs - Number(days) * 86400 * 1000;
+    return records.reduce((sum, rec) => rec.time.getTime() >= cutMs ? sum + rec.rate8h : sum, 0);
+  };
+
+  const currentRows = [];
+  const cumulativeRows = [];
+  for (const symbol of TARGETS) {
+    const records = recordsBySymbol.get(symbol) || [];
+    const latest = records.length ? records[records.length - 1] : null;
+    const latest8h = latest ? latest.rate8h : 0;
+    const oneHourEquivalent = latest8h / 8;
+
+    currentRows.push([
+      symbol,
+      oneHourEquivalent,
+      latest8h,
+      latest8h * 3,
+      latest8h * 3 * 30,
+      latest8h * 3 * 365,
+    ]);
+
+    cumulativeRows.push([
+      symbol,
+      sumSince(records, 1),
+      sumSince(records, 3),
+      sumSince(records, 7),
+      sumSince(records, 15),
+      sumSince(records, 30),
+      records.reduce((sum, rec) => sum + rec.rate8h, 0),
+      records.length,
+      records.length ? records[0].timestampKst : "",
+      latest ? latest.timestampKst : "",
+    ]);
+  }
+
+  const timelineRows = Array.from(timeline.entries())
+    .sort((a, b) => b[0] - a[0])
+    .map(([, item]) => [item.timestampKst].concat(TARGETS.map((symbol) => item.rates[symbol] ?? "")));
+
+  const sh = histSS.getSheetByName(FUNDING_SHEET_VARIATIONAL_VIEW) ||
+    histSS.insertSheet(FUNDING_SHEET_VARIATIONAL_VIEW);
+  const needRows = Math.max(30, 21 + timelineRows.length);
+  const timelineWidth = 1 + TARGETS.length;
+  const needCols = Math.max(10, timelineWidth);
+  if (sh.getMaxRows() < needRows) sh.insertRowsAfter(sh.getMaxRows(), needRows - sh.getMaxRows());
+  if (sh.getMaxColumns() < needCols) sh.insertColumnsAfter(sh.getMaxColumns(), needCols - sh.getMaxColumns());
+
+  sh.clear();
+  sh.setHiddenGridlines(true);
+  sh.setTabColor("#16a085");
+  sh.setFrozenRows(5);
+  sh.setFrozenColumns(1);
+
+  const latestKst = funding_toKstIsoFromAny_(new Date(latestMs));
+  sh.getRange(1, 1).setValue("VARIATIONAL FUNDING HISTORY");
+  sh.getRange(1, 1, 1, needCols)
+    .setBackground("#0b1117")
+    .setFontColor("#f4f7fa")
+    .setFontWeight("bold")
+    .setFontSize(14);
+  sh.getRange(2, 1, 1, 4).setValues([[
+    "as_of_kst", latestKst, "observations", recordByKey.size,
+  ]]);
+
+  sh.getRange(4, 1).setValue("CURRENT RATE SCALED TO INTERVAL");
+  sh.getRange(5, 1, 1, 6).setValues([[
+    "Market", "1h equivalent", "8h", "1d", "1M (30d)", "1Y (365d)",
+  ]]);
+  sh.getRange(6, 1, currentRows.length, 6).setValues(currentRows);
+
+  sh.getRange(12, 1).setValue("HISTORICAL CUMULATIVE FUNDING");
+  sh.getRange(13, 1, 1, 10).setValues([[
+    "Market", "1d", "3d", "7d", "15d", "30d", "ALL",
+    "observations", "first timestamp", "last timestamp",
+  ]]);
+  sh.getRange(14, 1, cumulativeRows.length, 10).setValues(cumulativeRows);
+
+  sh.getRange(20, 1).setValue("HISTORICAL 8H SNAPSHOTS (LATEST FIRST)");
+  sh.getRange(21, 1, 1, timelineWidth).setValues([["timestamp_kst"].concat(TARGETS)]);
+  if (timelineRows.length) {
+    sh.getRange(22, 1, timelineRows.length, timelineWidth).setValues(timelineRows);
+  }
+
+  const sectionRanges = [sh.getRange(4, 1, 1, 10), sh.getRange(12, 1, 1, 10), sh.getRange(20, 1, 1, 10)];
+  sectionRanges.forEach((range) => range
+    .setBackground("#15212b")
+    .setFontColor("#d8e4eb")
+    .setFontWeight("bold"));
+
+  const headerRanges = [sh.getRange(5, 1, 1, 6), sh.getRange(13, 1, 1, 10), sh.getRange(21, 1, 1, timelineWidth)];
+  headerRanges.forEach((range) => range
+    .setBackground("#253440")
+    .setFontColor("#ffffff")
+    .setFontWeight("bold")
+    .setHorizontalAlignment("center"));
+
+  sh.getRange(6, 2, currentRows.length, 5).setNumberFormat("0.0000%");
+  sh.getRange(14, 2, cumulativeRows.length, 6).setNumberFormat("0.0000%");
+  if (timelineRows.length) sh.getRange(22, 2, timelineRows.length, TARGETS.length).setNumberFormat("0.0000%");
+
+  const rateRanges = [
+    sh.getRange(6, 2, currentRows.length, 5),
+    sh.getRange(14, 2, cumulativeRows.length, 6),
+  ];
+  if (timelineRows.length) rateRanges.push(sh.getRange(22, 2, timelineRows.length, TARGETS.length));
+  sh.setConditionalFormatRules([
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberGreaterThan(0)
+      .setFontColor("#00a98f")
+      .setRanges(rateRanges)
+      .build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberLessThan(0)
+      .setFontColor("#e55353")
+      .setRanges(rateRanges)
+      .build(),
+  ]);
+
+  sh.setColumnWidth(1, 220);
+  for (let c = 2; c <= 8; c++) sh.setColumnWidth(c, 125);
+  sh.setColumnWidth(9, 210);
+  sh.setColumnWidth(10, 210);
+  sh.getRange(1, 1, needRows, needCols).setVerticalAlignment("middle");
+
+  safeAlert_(
+    "Variational funding history view 업데이트 완료\n" +
+      "sheet: " + histSS.getName() + " / " + FUNDING_SHEET_VARIATIONAL_VIEW + "\n" +
+      "snapshots: " + timelineRows.length + "\n" +
+      "asOf: " + latestKst
+  );
+}
+
+/******************************************************
+ * Optimizer V2: account venues + dynamic assets
+ ******************************************************/
+
+function funding_syncOptimizerRegistryNow() {
+  const result = funding_withSpreadsheetRetry_(
+    "optimizer venues/assets 동기화",
+    () => funding_syncOptimizerRegistry_({ showAlert: true }),
+    4
+  );
+  return result;
+}
+
+function funding_normalizeVenueStatus_(raw) {
+  const status = String(raw || "ACTIVE").trim().toUpperCase();
+  return ["ACTIVE", "HOLD", "EXIT", "OFF"].includes(status) ? status : "ACTIVE";
+}
+
+function funding_normalizeAssetStatus_(raw) {
+  const status = String(raw || "ACTIVE").trim().toUpperCase();
+  return ["ACTIVE", "HOLD", "OFF"].includes(status) ? status : "ACTIVE";
+}
+
+function funding_isFalseLike_(value) {
+  const s = String(value == null ? "" : value).trim().toUpperCase();
+  return s === "FALSE" || s === "0" || s === "NO" || s === "N" || s === "OFF";
+}
+
+function funding_readPositionStateV2_(shPos) {
+  const qtyByKey = new Map();
+  const markByKey = new Map();
+  const symbols = new Set();
+  const venues = new Set();
+  const targetBySymbol = {};
+  if (!shPos || shPos.getLastRow() < 2) {
+    return { qtyByKey, markByKey, symbols, venues, targetBySymbol };
+  }
+
+  SpreadsheetApp.flush();
+  const lastCol = shPos.getLastColumn();
+  const header = shPos.getRange(1, 1, 1, lastCol).getValues()[0].map((v) => String(v || "").trim());
+  const iEx = header.indexOf("exchange");
+  const iSym = header.indexOf("symbol");
+  const iQty = header.indexOf("qty");
+  const iMark = header.indexOf("mark_price");
+  const iType = header.indexOf("instrument_type");
+  const iInclude = header.indexOf("include_in_optimizer");
+  if ([iEx, iSym, iQty].some((i) => i < 0)) {
+    throw new Error("positions 헤더에 exchange/symbol/qty가 필요해.");
+  }
+
+  const rows = shPos.getRange(2, 1, shPos.getLastRow() - 1, lastCol).getValues();
+  for (const row of rows) {
+    const venueId = String(row[iEx] || "").trim().toLowerCase();
+    const symbol = String(row[iSym] || "").trim().toUpperCase();
+    if (!venueId || !symbol) continue;
+    if (iType >= 0 && String(row[iType] || "").trim().toUpperCase() === "SPOT") continue;
+    if (iInclude >= 0 && String(row[iInclude] || "").trim() !== "" && funding_isFalseLike_(row[iInclude])) continue;
+
+    venues.add(venueId);
+    symbols.add(symbol);
+    const key = `${venueId}|${symbol}`;
+    const qty = Number(row[iQty]);
+    const safeQty = Number.isFinite(qty) ? qty : 0;
+    qtyByKey.set(key, Number(qtyByKey.get(key) || 0) + safeQty);
+    targetBySymbol[symbol] = Number(targetBySymbol[symbol] || 0) + safeQty;
+
+    if (iMark >= 0) {
+      const mark = Number(row[iMark]);
+      if (Number.isFinite(mark) && mark > 0) markByKey.set(key, mark);
+    }
+  }
+
+  return { qtyByKey, markByKey, symbols, venues, targetBySymbol };
+}
+
+function funding_getVenueFundingExchangeMapSafe_(ss) {
+  const out = new Map();
+  out.set("variational_2", "variational");
+  const sh = ss ? ss.getSheetByName(OPT_SHEET_VENUES) : null;
+  if (!sh || sh.getLastRow() < 2) return out;
+  const vals = sh.getDataRange().getValues();
+  const header = vals[0].map((v) => String(v || "").trim());
+  const iVenue = header.indexOf("venue_id");
+  const iFunding = header.indexOf("funding_exchange");
+  if (iVenue < 0 || iFunding < 0) return out;
+  for (let i = 1; i < vals.length; i++) {
+    const venue = String(vals[i][iVenue] || "").trim().toLowerCase();
+    const fundingEx = String(vals[i][iFunding] || "").trim().toLowerCase();
+    if (venue && fundingEx) out.set(venue, fundingEx);
+  }
+  return out;
+}
+
+function funding_readVenueConfigsV2_(sh) {
+  const out = [];
+  if (!sh || sh.getLastRow() < 2) return out;
+  const vals = sh.getDataRange().getValues();
+  const h = vals[0].map((v) => String(v || "").trim());
+  const idx = (name) => h.indexOf(name);
+  const seen = new Set();
+  for (let i = 1; i < vals.length; i++) {
+    const row = vals[i];
+    const venueId = String(row[idx("venue_id")] || "").trim().toLowerCase();
+    if (!venueId) continue;
+    if (seen.has(venueId)) throw new Error(`opt_venues venue_id 중복: ${venueId}`);
+    seen.add(venueId);
+    const fundingExchange = String(row[idx("funding_exchange")] || venueId).trim().toLowerCase();
+    out.push({
+      venueId,
+      fundingExchange,
+      status: funding_normalizeVenueStatus_(row[idx("status")]),
+      collectHistory: !funding_isFalseLike_(row[idx("collect_history")]),
+      depositUsd: Math.max(0, Number(row[idx("deposit_usd")]) || 0),
+      minGrossUsd: Math.max(0, Number(row[idx("min_gross_oi_usd")]) || 0),
+      grossMaxMult: Math.max(0, Number(row[idx("gross_max_mult")]) || 0),
+      dirLimitMult: Math.max(0, Number(row[idx("dir_limit_mult")]) || 0),
+      feeBps: Math.max(0, Number(row[idx("fee_bps")]) || 0),
+      slippageBps: Math.max(0, Number(row[idx("slippage_bps")]) || 0),
+      venueGroup: String(row[idx("venue_group")] || fundingExchange).trim().toLowerCase(),
+    });
+  }
+  return out;
+}
+
+function funding_readAssetConfigsV2_(sh) {
+  const out = [];
+  if (!sh || sh.getLastRow() < 2) return out;
+  const vals = sh.getDataRange().getValues();
+  const h = vals[0].map((v) => String(v || "").trim());
+  const idx = (name) => h.indexOf(name);
+  const seen = new Set();
+  for (let i = 1; i < vals.length; i++) {
+    const row = vals[i];
+    const symbol = String(row[idx("symbol")] || "").trim().toUpperCase();
+    if (!symbol) continue;
+    if (seen.has(symbol)) throw new Error(`opt_assets symbol 중복: ${symbol}`);
+    seen.add(symbol);
+    const minCoverageRaw = Number(row[idx("min_history_coverage")]);
+    out.push({
+      symbol,
+      status: funding_normalizeAssetStatus_(row[idx("status")]),
+      assetGroup: String(row[idx("asset_group")] || "OTHER").trim().toUpperCase(),
+      capMult: Math.max(0, Number(row[idx("cap_mult")]) || 0),
+      slippageQty: Math.max(0, Number(row[idx("slippage_qty")]) || 0),
+      minHistoryCoverage: Number.isFinite(minCoverageRaw) ? Math.max(0, Math.min(1, minCoverageRaw)) : FUNDING_ROLL_MIN_COVERAGE,
+    });
+  }
+  return out;
+}
+
+function funding_syncOptimizerRegistry_(options) {
+  const opts = options || {};
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shInputs = funding_initSheet_(ss, OPT_SHEET_INPUTS, ["key", "value"]);
+  funding_ensureKeyValues_(shInputs, OPT_DEFAULT_INPUTS);
+  const inputs = funding_readKeyValues_(shInputs);
+  const shPos = ss.getSheetByName(FUNDING_SHEET_POSITIONS);
+  if (!shPos) throw new Error("positions 시트가 없어. Init sheets 먼저 실행해줘.");
+  const pos = funding_readPositionStateV2_(shPos);
+
+  const shVenues = funding_initSheet_(ss, OPT_SHEET_VENUES, OPT_VENUE_HEADERS);
+  const existingVenues = new Set(funding_readVenueConfigsV2_(shVenues).map((v) => v.venueId));
+  const venueIds = new Set(OPT_EXCHANGES.concat(Array.from(pos.venues)));
+  const venueRows = [];
+  for (const venueId of venueIds) {
+    if (existingVenues.has(venueId)) continue;
+    const fundingExchange = venueId === "variational_2" ? "variational" : venueId;
+    const deposit = Math.max(0, Number(inputs[`deposit_${venueId}_usd`]) || 0);
+    const hasPosition = Array.from(pos.qtyByKey.entries()).some(([key, qty]) => key.indexOf(`${venueId}|`) === 0 && Math.abs(Number(qty) || 0) > 1e-12);
+    const status = deposit > 0 ? "ACTIVE" : (hasPosition ? "HOLD" : "OFF");
+    const minGross = venueId === "variational"
+      ? Math.max(0, Number(inputs["variational_min_gross_oi_usd"]) || 0)
+      : Math.max(0, Number(inputs[`${venueId}_min_gross_oi_usd`]) || 0);
+    const grossDefault = fundingExchange === "variational" ? 20 : 5;
+    const grossMaxMult = Math.max(0, Number(inputs[`${venueId}_gross_max_mult`]) || grossDefault);
+    const dirLimitMult = Math.max(0, Number(inputs[`${venueId}_dir_limit_mult`]) || 0);
+    const feeBps = Math.max(0, Number(inputs[`${venueId}_fee_bps`]) || 0);
+    const slippageBps = Math.max(0, Number(inputs[`${venueId}_slippage_bps`]) || 0);
+    venueRows.push([
+      venueId, fundingExchange, status, true, deposit, minGross, grossMaxMult,
+      dirLimitMult, feeBps, slippageBps, fundingExchange === "variational" ? "variational" : fundingExchange,
+    ]);
+  }
+  if (venueRows.length) {
+    shVenues.getRange(shVenues.getLastRow() + 1, 1, venueRows.length, OPT_VENUE_HEADERS.length).setValues(venueRows);
+  }
+
+  const shAssets = funding_initSheet_(ss, OPT_SHEET_ASSETS, OPT_ASSET_HEADERS);
+  const existingAssets = new Set(funding_readAssetConfigsV2_(shAssets).map((a) => a.symbol));
+  const symbols = new Set(TARGETS.concat(Array.from(pos.symbols)));
+  const shCurrent = ss.getSheetByName(FUNDING_SHEET_CURRENT);
+  if (shCurrent && shCurrent.getLastRow() >= 2) {
+    const vals = shCurrent.getDataRange().getValues();
+    const h = vals[0].map((v) => String(v || "").trim());
+    const iSym = h.indexOf("symbol");
+    if (iSym >= 0) for (let i = 1; i < vals.length; i++) {
+      const symbol = String(vals[i][iSym] || "").trim().toUpperCase();
+      if (symbol) symbols.add(symbol);
+    }
+  }
+
+  const assetRows = [];
+  for (const symbol of symbols) {
+    if (existingAssets.has(symbol)) continue;
+    const lower = symbol.toLowerCase();
+    const capMult = Math.max(0, Number(inputs[`${lower}_cap_mult`]) || 0);
+    const slippageQty = Math.max(0, Number(inputs[`live_slippage_qty_${lower}`]) || 0);
+    const group = ["BTC", "ETH", "SOL", "BNB", "HYPE"].includes(symbol) ? "CRYPTO" : "OTHER";
+    assetRows.push([symbol, "ACTIVE", group, capMult, slippageQty, FUNDING_ROLL_MIN_COVERAGE]);
+  }
+  if (assetRows.length) {
+    shAssets.getRange(shAssets.getLastRow() + 1, 1, assetRows.length, OPT_ASSET_HEADERS.length).setValues(assetRows);
+  }
+
+  const venueConfigs = funding_readVenueConfigsV2_(shVenues);
+  const assetConfigs = funding_readAssetConfigsV2_(shAssets);
+  funding_ensurePositionTemplateRows_(
+    shPos,
+    venueConfigs.map((v) => v.venueId),
+    assetConfigs.map((a) => a.symbol)
+  );
+
+  const refreshedPos = funding_readPositionStateV2_(shPos);
+  const shTargets = funding_initSheet_(ss, OPT_SHEET_TARGETS, ["symbol", "target_qty (from positions)"]);
+  if (shTargets.getMaxRows() > 1) {
+    shTargets.getRange(2, 1, shTargets.getMaxRows() - 1, Math.max(2, shTargets.getMaxColumns())).clearContent();
+  }
+  const targetRows = assetConfigs.map((a) => [a.symbol, Number(refreshedPos.targetBySymbol[a.symbol] || 0)]);
+  if (targetRows.length) shTargets.getRange(2, 1, targetRows.length, 2).setValues(targetRows);
+
+  if (opts.showAlert !== false) {
+    safeAlert_(
+      "✅ optimizer registry 동기화 완료\n" +
+      `venues added: ${venueRows.length}\nassets added: ${assetRows.length}\n` +
+      "사용하지 않는 거래소는 opt_venues.status를 OFF/HOLD/EXIT로 설정해줘."
+    );
+  }
+  return { venuesAdded: venueRows.length, assetsAdded: assetRows.length };
+}
+
+function funding_signalWindowStatsV2_(agg, days, minCoverage) {
+  if (!agg) return { avg: 0, stddev: 0, cnt: 0, coverage: 0, usable: false };
+  const suffix = String(days);
+  const sum = Number(agg[`sum${suffix}`]) || 0;
+  const sumSq = Number(agg[`sumSq${suffix}`]) || 0;
+  const cnt = Number(agg[`cnt${suffix}`]) || 0;
+  const interval = Number(agg.interval_s) || 28800;
+  const expectedCount = Math.max(1, Math.round(days * 86400 / interval));
+  const coverage = cnt / expectedCount;
+  const avg = cnt > 0 ? sum / cnt : 0;
+  const variance = cnt > 0 ? Math.max(0, sumSq / cnt - avg * avg) : 0;
+  return {
+    avg,
+    stddev: Math.sqrt(variance),
+    cnt,
+    coverage,
+    usable: cnt > 0 && coverage >= minCoverage,
+  };
+}
+
+function funding_buildHistoricalSignalsV2_(venues, assets, rateMap, inputs) {
+  let rollMap = new Map();
+  try {
+    rollMap = funding_buildRollingAvgMapFromHistory_();
+  } catch (e) {
+    Logger.log("historical signals fallback to live: " + String(e && e.message ? e.message : e));
+  }
+
+  const weights = {
+    3: Math.max(0, Number(inputs["historical_weight_3d"]) || 0),
+    7: Math.max(0, Number(inputs["historical_weight_7d"]) || 0),
+    15: Math.max(0, Number(inputs["historical_weight_15d"]) || 0),
+    30: Math.max(0, Number(inputs["historical_weight_30d"]) || 0),
+    live: Math.max(0, Number(inputs["historical_weight_live"]) || 0),
+  };
+  const fundingExchanges = Array.from(new Set(venues.map((v) => v.fundingExchange)));
+  const out = new Map();
+
+  for (const fundingExchange of fundingExchanges) {
+    for (const asset of assets) {
+      const symbol = asset.symbol;
+      const key = `${fundingExchange}|${symbol}`;
+      const agg = rollMap.get(key);
+      const liveRow = rateMap.get(key) || {};
+      const liveRate = Number(liveRow.rate8h);
+      const windows = {
+        3: funding_signalWindowStatsV2_(agg, 3, asset.minHistoryCoverage),
+        7: funding_signalWindowStatsV2_(agg, 7, asset.minHistoryCoverage),
+        15: funding_signalWindowStatsV2_(agg, 15, asset.minHistoryCoverage),
+        30: funding_signalWindowStatsV2_(agg, 30, asset.minHistoryCoverage),
+      };
+
+      let weightedSum = 0;
+      let weightSum = 0;
+      const sources = [];
+      for (const days of [3, 7, 15, 30]) {
+        const w = weights[days];
+        const stat = windows[days];
+        if (!(w > 0) || !stat.usable) continue;
+        weightedSum += stat.avg * w;
+        weightSum += w;
+        sources.push(`${days}d`);
+      }
+      const historyUsable = sources.length > 0;
+      if (weights.live > 0 && Number.isFinite(liveRate)) {
+        weightedSum += liveRate * weights.live;
+        weightSum += weights.live;
+        sources.push("live");
+      }
+
+      const expectedRate = weightSum > 0 ? weightedSum / weightSum : (Number.isFinite(liveRate) ? liveRate : 0);
+      const longest = windows[30].usable ? windows[30]
+        : windows[15].usable ? windows[15]
+          : windows[7].usable ? windows[7]
+            : windows[3];
+      const confidence = historyUsable
+        ? Math.max(0, Math.min(1, longest.coverage))
+        : (Number.isFinite(liveRate) ? 0.2 : 0);
+
+      out.set(key, {
+        fundingExchange,
+        symbol,
+        expectedRate8h: expectedRate,
+        stddev8h: historyUsable ? longest.stddev : 0,
+        confidence,
+        historyUsable,
+        windows,
+        liveRate8h: Number.isFinite(liveRate) ? liveRate : 0,
+        source: historyUsable ? sources.join("+") : (Number.isFinite(liveRate) ? "live_fallback" : "missing"),
+      });
+    }
+  }
+  return out;
+}
+
+function funding_writeHistoricalSignalsV2_(ss, signals) {
+  const sh = funding_initSheet_(ss, OPT_SHEET_HISTORY_SIGNALS, [
+    "funding_exchange", "symbol", "expected_rate_8h", "stddev_8h", "confidence",
+    "history_usable", "avg_3d", "coverage_3d", "avg_7d", "coverage_7d",
+    "avg_15d", "coverage_15d", "avg_30d", "coverage_30d", "live_rate_8h", "source",
+  ]);
+  if (sh.getMaxRows() > 1) {
+    sh.getRange(2, 1, sh.getMaxRows() - 1, Math.max(16, sh.getMaxColumns())).clearContent();
+  }
+  const rows = Array.from(signals.values())
+    .sort((a, b) => {
+      const exCmp = a.fundingExchange.localeCompare(b.fundingExchange);
+      return exCmp || a.symbol.localeCompare(b.symbol);
+    })
+    .map((s) => [
+      s.fundingExchange, s.symbol, s.expectedRate8h, s.stddev8h, s.confidence,
+      s.historyUsable, s.windows[3].avg, s.windows[3].coverage,
+      s.windows[7].avg, s.windows[7].coverage,
+      s.windows[15].avg, s.windows[15].coverage,
+      s.windows[30].avg, s.windows[30].coverage,
+      s.liveRate8h, s.source,
+    ]);
+  if (rows.length) sh.getRange(2, 1, rows.length, 16).setValues(rows);
+}
+
+function funding_buildMarkFallbackV2_(rateMap, positionState) {
+  const out = {};
+  for (const [key, row] of rateMap.entries()) {
+    const symbol = String(key).split("|")[1];
+    const mark = Number(row && row.mark);
+    if (symbol && Number.isFinite(mark) && mark > 0 && !(out[symbol] > 0)) out[symbol] = mark;
+  }
+  for (const [key, markRaw] of positionState.markByKey.entries()) {
+    const symbol = String(key).split("|")[1];
+    const mark = Number(markRaw);
+    if (symbol && Number.isFinite(mark) && mark > 0 && !(out[symbol] > 0)) out[symbol] = mark;
+  }
+  return out;
+}
+
+function funding_getMarkV2_(venue, symbol, rateMap, markFallback, positionState) {
+  const direct = rateMap.get(`${venue.fundingExchange}|${symbol}`) || {};
+  const directMark = Number(direct.mark);
+  if (Number.isFinite(directMark) && directMark > 0) return directMark;
+  const posMark = Number(positionState.markByKey.get(`${venue.venueId}|${symbol}`));
+  if (Number.isFinite(posMark) && posMark > 0) return posMark;
+  return Number(markFallback[symbol]) || 0;
+}
+
+function funding_buildOptimizerCostMapV2_(venues, assets, inputs) {
+  const out = new Map();
+  const useLiveRaw = inputs["use_live_slippage_api"];
+  const useLive = String(useLiveRaw == null ? "" : useLiveRaw).trim() === "" ? true : funding_isTrueLike_(useLiveRaw);
+  const endpoint = funding_buildSlippageApiEndpoint_(inputs["slippage_api_url"]);
+  let batch = { byKey: new Map(), errors: [] };
+
+  if (useLive && endpoint) {
+    const reqs = [];
+    for (const asset of assets) {
+      if (!(asset.slippageQty > 0)) continue;
+      for (const side of ["buy", "sell"]) {
+        reqs.push({
+          key: `${asset.symbol}|${funding_round_(asset.slippageQty)}|${side}`,
+          coin: asset.symbol,
+          qty: asset.slippageQty,
+          side,
+        });
+      }
+    }
+    try {
+      batch = funding_fetchLiveSlippageMapsBatch_(endpoint, reqs);
+    } catch (e) {
+      batch = { byKey: new Map(), errors: [String(e && e.message ? e.message : e)] };
+    }
+  }
+
+  for (const venue of venues) {
+    for (const asset of assets) {
+      for (const side of ["buy", "sell"]) {
+        let feeBps = venue.feeBps;
+        let slippageBps = venue.slippageBps;
+        let source = "venue_manual";
+        if (useLive && asset.slippageQty > 0) {
+          const reqKey = `${asset.symbol}|${funding_round_(asset.slippageQty)}|${side}`;
+          const liveMap = batch.byKey.get(reqKey) || new Map();
+          const live = liveMap.get(venue.fundingExchange);
+          if (live) {
+            feeBps = Math.max(0, Number(live.feeBps) || 0);
+            slippageBps = Math.max(0, Number(live.slippageBps) || 0);
+            source = "live_ref_qty";
+          }
+        }
+        out.set(`${venue.venueId}|${asset.symbol}|${side}`, { feeBps, slippageBps, source });
+      }
+    }
+  }
+  return { map: out, errors: batch.errors || [] };
+}
+
+function funding_buildOptimizationModelV2_(ctx, mode, neutralityCapUsd) {
+  const engine = LinearOptimizationService.createEngine();
+  const cells = [];
+  const byVenue = new Map();
+  const bySymbol = new Map();
+  const BIG = 1e15;
+  let cellIndex = 0;
+
+  for (const venue of ctx.venues) {
+    byVenue.set(venue.venueId, []);
+    for (const asset of ctx.assets) {
+      const symbol = asset.symbol;
+      const currentQty = Number(ctx.positionState.qtyByKey.get(`${venue.venueId}|${symbol}`) || 0);
+      if (venue.status === "OFF") {
+        if (Math.abs(currentQty) > 1e-10) {
+          throw new Error(`${venue.venueId}는 OFF인데 ${symbol} 현재 포지션 ${currentQty}가 있어. HOLD 또는 EXIT로 바꿔줘.`);
+        }
+        continue;
+      }
+      if (asset.status === "OFF") {
+        if (Math.abs(currentQty) > 1e-10) {
+          throw new Error(`${symbol}은 opt_assets에서 OFF인데 현재 포지션이 있어. HOLD로 바꿔줘.`);
+        }
+        continue;
+      }
+
+      const mark = funding_getMarkV2_(venue, symbol, ctx.rateMap, ctx.markFallback, ctx.positionState);
+      if (!(mark > 0)) {
+        if (Math.abs(currentQty) > 1e-10) throw new Error(`${venue.venueId}|${symbol} mark_price가 없어 현재 포지션을 보존할 수 없어.`);
+        continue;
+      }
+
+      const marketKey = `${venue.fundingExchange}|${symbol}`;
+      const hasLiveMarket = ctx.rateMap.has(marketKey);
+      const signal = ctx.signals.get(marketKey) || {
+        expectedRate8h: 0, stddev8h: 0, confidence: 0, historyUsable: false, source: "missing", liveRate8h: 0,
+      };
+      const maxGrossUsd = venue.depositUsd > 0 && venue.grossMaxMult > 0
+        ? venue.depositUsd * venue.grossMaxMult
+        : 0;
+      const canOptimize = venue.status === "ACTIVE" && asset.status === "ACTIVE" &&
+        hasLiveMarket && signal.historyUsable && maxGrossUsd > 0;
+      const forcedQty = venue.status === "EXIT" ? 0 : currentQty;
+      if (!canOptimize && Math.abs(forcedQty) < 1e-12 && !hasLiveMarket) continue;
+
+      const maxQty = canOptimize
+        ? Math.max(Math.abs(currentQty), maxGrossUsd / mark, 1e-8)
+        : Math.max(Math.abs(forcedQty), 1e-8);
+      const id = cellIndex++;
+      const names = {
+        long: `L_${id}`,
+        short: `S_${id}`,
+        buy: `TB_${id}`,
+        sell: `TS_${id}`,
+        side: `B_${id}`,
+      };
+
+      if (canOptimize) {
+        engine.addVariable(names.long, 0, maxQty);
+        engine.addVariable(names.short, 0, maxQty);
+        engine.addVariable(names.side, 0, 1, LinearOptimizationService.VariableType.INTEGER);
+        const longSign = engine.addConstraint(-BIG, 0);
+        longSign.setCoefficient(names.long, 1);
+        longSign.setCoefficient(names.side, -maxQty);
+        const shortSign = engine.addConstraint(-BIG, maxQty);
+        shortSign.setCoefficient(names.short, 1);
+        shortSign.setCoefficient(names.side, maxQty);
+      } else {
+        const fixedLong = Math.max(0, forcedQty);
+        const fixedShort = Math.max(0, -forcedQty);
+        engine.addVariable(names.long, fixedLong, fixedLong);
+        engine.addVariable(names.short, fixedShort, fixedShort);
+      }
+
+      const turnoverUpper = maxQty + Math.abs(currentQty) + 1;
+      engine.addVariable(names.buy, 0, turnoverUpper);
+      engine.addVariable(names.sell, 0, turnoverUpper);
+      const turnoverEq = engine.addConstraint(currentQty, currentQty);
+      turnoverEq.setCoefficient(names.long, 1);
+      turnoverEq.setCoefficient(names.short, -1);
+      turnoverEq.setCoefficient(names.buy, -1);
+      turnoverEq.setCoefficient(names.sell, 1);
+
+      const buyCost = ctx.costMap.get(`${venue.venueId}|${symbol}|buy`) || { feeBps: venue.feeBps, slippageBps: venue.slippageBps };
+      const sellCost = ctx.costMap.get(`${venue.venueId}|${symbol}|sell`) || { feeBps: venue.feeBps, slippageBps: venue.slippageBps };
+      const cell = {
+        venue, asset, symbol, currentQty, mark, signal, canOptimize, maxQty, names,
+        buyCostBps: Math.max(0, Number(buyCost.feeBps) || 0) + Math.max(0, Number(buyCost.slippageBps) || 0),
+        sellCostBps: Math.max(0, Number(sellCost.feeBps) || 0) + Math.max(0, Number(sellCost.slippageBps) || 0),
+      };
+      cells.push(cell);
+      byVenue.get(venue.venueId).push(cell);
+      if (!bySymbol.has(symbol)) bySymbol.set(symbol, []);
+      bySymbol.get(symbol).push(cell);
+    }
+  }
+
+  for (const asset of ctx.assets) {
+    const target = Number(ctx.positionState.targetBySymbol[asset.symbol] || 0);
+    const symbolCells = bySymbol.get(asset.symbol) || [];
+    if (!symbolCells.length) {
+      if (Math.abs(target) > 1e-10) throw new Error(`${asset.symbol} 목표 수량 ${target}을 담을 venue가 없어.`);
+      continue;
+    }
+    const targetConstraint = engine.addConstraint(target, target);
+    for (const cell of symbolCells) {
+      targetConstraint.setCoefficient(cell.names.long, 1);
+      targetConstraint.setCoefficient(cell.names.short, -1);
+    }
+  }
+
+  const neutralTerms = [];
+  for (let vi = 0; vi < ctx.venues.length; vi++) {
+    const venue = ctx.venues[vi];
+    if (venue.status === "OFF") continue;
+    const venueCells = byVenue.get(venue.venueId) || [];
+    const currentGross = venueCells.reduce((sum, c) => sum + Math.abs(c.currentQty * c.mark), 0);
+    const configuredMax = venue.depositUsd * venue.grossMaxMult;
+    const dirUpper = Math.max(1, currentGross, configuredMax, venue.minGrossUsd) * 2 + 1;
+    const dPos = `DP_${vi}`;
+    const dNeg = `DN_${vi}`;
+    engine.addVariable(dPos, 0, dirUpper);
+    engine.addVariable(dNeg, 0, dirUpper);
+    const dirEq = engine.addConstraint(0, 0);
+    for (const cell of venueCells) {
+      dirEq.setCoefficient(cell.names.long, cell.mark);
+      dirEq.setCoefficient(cell.names.short, -cell.mark);
+    }
+    dirEq.setCoefficient(dPos, -1);
+    dirEq.setCoefficient(dNeg, 1);
+    neutralTerms.push({ dPos, dNeg });
+
+    if (venue.status === "ACTIVE" || venue.status === "EXIT") {
+      const grossMax = venue.depositUsd * venue.grossMaxMult;
+      if (venue.status === "ACTIVE" && !(grossMax > 0)) {
+        throw new Error(`${venue.venueId}가 ACTIVE인데 deposit_usd 또는 gross_max_mult가 0이야.`);
+      }
+      const lowerGross = venue.status === "ACTIVE" ? venue.minGrossUsd : 0;
+      const upperGross = grossMax > 0 ? grossMax : 0;
+      if (lowerGross > upperGross + 1e-6) {
+        throw new Error(`${venue.venueId} min_gross_oi_usd가 gross max보다 커.`);
+      }
+      const grossConstraint = engine.addConstraint(lowerGross, upperGross);
+      for (const cell of venueCells) {
+        grossConstraint.setCoefficient(cell.names.long, cell.mark);
+        grossConstraint.setCoefficient(cell.names.short, cell.mark);
+      }
+
+      const dirLimit = venue.depositUsd * venue.dirLimitMult;
+      const dirConstraint = engine.addConstraint(-dirLimit, dirLimit);
+      for (const cell of venueCells) {
+        dirConstraint.setCoefficient(cell.names.long, cell.mark);
+        dirConstraint.setCoefficient(cell.names.short, -cell.mark);
+      }
+
+      for (const cell of venueCells) {
+        if (!(cell.asset.capMult > 0)) continue;
+        const capUsd = venue.depositUsd * cell.asset.capMult;
+        const capConstraint = engine.addConstraint(0, capUsd);
+        capConstraint.setCoefficient(cell.names.long, cell.mark);
+        capConstraint.setCoefficient(cell.names.short, cell.mark);
+      }
+    }
+  }
+
+  const groupMin = Math.max(0, Number(ctx.inputs["variational_group_min_gross_oi_usd"]) || 0);
+  if (groupMin > 0) {
+    const groupConstraint = engine.addConstraint(groupMin, BIG);
+    let groupCells = 0;
+    for (const cell of cells) {
+      if (cell.venue.venueGroup !== "variational") continue;
+      groupConstraint.setCoefficient(cell.names.long, cell.mark);
+      groupConstraint.setCoefficient(cell.names.short, cell.mark);
+      groupCells++;
+    }
+    if (!groupCells) throw new Error("variational_group_min_gross_oi_usd가 있지만 Variational venue가 없어.");
+  }
+
+  if (Number.isFinite(neutralityCapUsd)) {
+    const neutralCap = engine.addConstraint(0, Math.max(0, neutralityCapUsd));
+    for (const term of neutralTerms) {
+      neutralCap.setCoefficient(term.dPos, 1);
+      neutralCap.setCoefficient(term.dNeg, 1);
+    }
+  }
+
+  if (mode === "neutrality") {
+    for (const term of neutralTerms) {
+      engine.setObjectiveCoefficient(term.dPos, 1);
+      engine.setObjectiveCoefficient(term.dNeg, 1);
+    }
+    engine.setMinimization();
+  } else {
+    const horizonDays = Math.max(1, Number(ctx.inputs["historical_horizon_days"]) || 30);
+    const intervals = horizonDays * 3;
+    const riskLambda = Math.max(0, Number(ctx.inputs["historical_risk_lambda"]) || 0);
+    const sqrtIntervals = Math.sqrt(intervals);
+    for (const cell of cells) {
+      const confidence = Math.max(0, Math.min(1, Number(cell.signal.confidence) || 0));
+      const rate = (Number(cell.signal.expectedRate8h) || 0) * confidence;
+      const riskPerQty = cell.mark * (Number(cell.signal.stddev8h) || 0) * sqrtIntervals * riskLambda;
+      engine.setObjectiveCoefficient(cell.names.long, -cell.mark * rate * intervals - riskPerQty);
+      engine.setObjectiveCoefficient(cell.names.short, cell.mark * rate * intervals - riskPerQty);
+      engine.setObjectiveCoefficient(cell.names.buy, -cell.mark * cell.buyCostBps / 10000);
+      engine.setObjectiveCoefficient(cell.names.sell, -cell.mark * cell.sellCostBps / 10000);
+    }
+    engine.setMaximization();
+  }
+
+  return { engine, cells, byVenue, bySymbol, neutralTerms };
+}
+
+function funding_extractOptimizationResultV2_(model, solution) {
+  const finalQtyByKey = new Map();
+  for (const cell of model.cells) {
+    const longQty = Number(solution.getVariableValue(cell.names.long)) || 0;
+    const shortQty = Number(solution.getVariableValue(cell.names.short)) || 0;
+    const qty = funding_round_(longQty - shortQty);
+    finalQtyByKey.set(`${cell.venue.venueId}|${cell.symbol}`, qty);
+  }
+  return finalQtyByKey;
+}
+
+function funding_validateOptimizationResultV2_(ctx, finalQtyByKey) {
+  const violations = [];
+  for (const asset of ctx.assets) {
+    let finalTotal = 0;
+    for (const venue of ctx.venues) {
+      finalTotal += Number(finalQtyByKey.get(`${venue.venueId}|${asset.symbol}`) || 0);
+    }
+    const target = Number(ctx.positionState.targetBySymbol[asset.symbol] || 0);
+    const tolerance = Math.max(1e-6, Math.abs(target) * 1e-8);
+    if (Math.abs(finalTotal - target) > tolerance) {
+      violations.push(`${asset.symbol}: final=${finalTotal}, target=${target}, diff=${finalTotal - target}`);
+    }
+  }
+  if (violations.length) {
+    throw new Error("Optimize result target mismatch\n" + violations.slice(0, 12).join("\n"));
+  }
+}
+
+function funding_optimizeAllocation() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  funding_withSpreadsheetRetry_(
+    "optimizer 사전 동기화",
+    () => funding_syncOptimizerRegistry_({ showAlert: false }),
+    4
+  );
+  try { funding_refreshOptRates_(); } catch (e) {}
+
+  const shInputs = ss.getSheetByName(OPT_SHEET_INPUTS);
+  const shVenues = ss.getSheetByName(OPT_SHEET_VENUES);
+  const shAssets = ss.getSheetByName(OPT_SHEET_ASSETS);
+  const shRates = ss.getSheetByName(OPT_SHEET_RATES);
+  const shPos = ss.getSheetByName(FUNDING_SHEET_POSITIONS);
+  if (!shInputs || !shVenues || !shAssets || !shRates || !shPos) {
+    throw new Error("optimizer 시트가 부족해. Funding → Init optimizer sheets 먼저 실행해줘.");
+  }
+
+  funding_ensureKeyValues_(shInputs, OPT_DEFAULT_INPUTS);
+  const inputs = funding_readKeyValues_(shInputs);
+  const venues = funding_readVenueConfigsV2_(shVenues);
+  const assets = funding_readAssetConfigsV2_(shAssets);
+  const positionState = funding_readPositionStateV2_(shPos);
+  const rateMap = funding_readRates_(shRates);
+  const markFallback = funding_buildMarkFallbackV2_(rateMap, positionState);
+  const signals = funding_buildHistoricalSignalsV2_(venues, assets, rateMap, inputs);
+  funding_writeHistoricalSignalsV2_(ss, signals);
+  const costResult = funding_buildOptimizerCostMapV2_(venues, assets, inputs);
+
+  const ctx = {
+    ss, inputs, venues, assets, positionState, rateMap, markFallback, signals,
+    costMap: costResult.map,
+  };
+  const solveSeconds = Math.max(5, Math.min(30, Number(inputs["optimizer_solve_seconds"]) || 25));
+
+  const neutralModel = funding_buildOptimizationModelV2_(ctx, "neutrality", null);
+  const neutralSolution = neutralModel.engine.solve(solveSeconds);
+  if (!neutralSolution.isValid()) {
+    throw new Error(`Optimizer neutrality stage 실패: ${neutralSolution.getStatus()}`);
+  }
+  const minNeutralUsd = Math.max(0, Number(neutralSolution.getObjectiveValue()) || 0);
+  const tolerancePct = Math.max(0, Number(inputs["neutrality_tolerance_pct"]) || 0);
+  const toleranceAbs = Math.max(0, Number(inputs["neutrality_tolerance_abs"]) || 0);
+  const neutralityCapUsd = minNeutralUsd * (1 + tolerancePct) + toleranceAbs;
+
+  const fundingModel = funding_buildOptimizationModelV2_(ctx, "funding", neutralityCapUsd);
+  const fundingSolution = fundingModel.engine.solve(solveSeconds);
+  if (!fundingSolution.isValid()) {
+    throw new Error(`Optimizer funding stage 실패: ${fundingSolution.getStatus()}`);
+  }
+
+  const finalQtyByKey = funding_extractOptimizationResultV2_(fundingModel, fundingSolution);
+  funding_validateOptimizationResultV2_(ctx, finalQtyByKey);
+  funding_writeOptimizationOutputsV2_(ctx, finalQtyByKey, {
+    neutralityMinUsd: minNeutralUsd,
+    neutralityCapUsd,
+    objectiveUsd: Number(fundingSolution.getObjectiveValue()) || 0,
+    costErrors: costResult.errors || [],
+  });
+
+  try { funding_estimateRebalanceTradingCost_({ showAlert: false, writeSheet: true }); } catch (e) {
+    Logger.log("rebalance cost detail failed: " + String(e && e.message ? e.message : e));
+  }
+
+  safeAlert_(
+    "✅ 역사적 펀딩 최적화 완료\n" +
+    `neutrality minimum: ${funding_fmtUsd_(minNeutralUsd)}\n` +
+    `neutrality cap: ${funding_fmtUsd_(neutralityCapUsd)}\n` +
+    `expected net objective: ${funding_fmtUsd_(fundingSolution.getObjectiveValue())}\n` +
+    `venues: ${venues.length}, assets: ${assets.length}` +
+    (costResult.errors && costResult.errors.length ? `\nlive cost fallback: ${costResult.errors.length}` : "")
+  );
+}
+
+function funding_calcVenueStatsV2_(ctx, finalQtyByKey, venue) {
+  let gross = 0;
+  let dir = 0;
+  const perSymbolAbs = {};
+  for (const asset of ctx.assets) {
+    const qty = Number(finalQtyByKey.get(`${venue.venueId}|${asset.symbol}`) || 0);
+    const mark = funding_getMarkV2_(venue, asset.symbol, ctx.rateMap, ctx.markFallback, ctx.positionState);
+    const notional = qty * mark;
+    gross += Math.abs(notional);
+    dir += notional;
+    perSymbolAbs[asset.symbol] = Math.abs(notional);
+  }
+  return { gross, dir, perSymbolAbs };
+}
+
+function funding_writeOptimizationOutputsV2_(ctx, finalQtyByKey, meta) {
+  const ss = ctx.ss;
+  const shSol = funding_initSheet_(ss, OPT_SHEET_SOLUTION, [
+    "exchange", "symbol", "qty", "mark_price", "funding_rate_8h",
+    "notional_usd", "pnl_8h_usd", "pnl_day_usd", "note",
+  ]);
+  if (shSol.getMaxRows() > 1) {
+    shSol.getRange(2, 1, shSol.getMaxRows() - 1, shSol.getMaxColumns()).clearContent();
+  }
+
+  const horizonDays = Math.max(1, Number(ctx.inputs["historical_horizon_days"]) || 30);
+  const intervals = horizonDays * 3;
+  const riskLambda = Math.max(0, Number(ctx.inputs["historical_risk_lambda"]) || 0);
+  const detailRows = [];
+  const compatRows = [];
+  let liveTotal8h = 0;
+  let liveTotalDay = 0;
+  let expectedFundingTotal = 0;
+  let riskTotal = 0;
+  let costTotal = 0;
+  let netTotal = 0;
+
+  for (const venue of ctx.venues) {
+    if (venue.status === "OFF") continue;
+    for (const asset of ctx.assets) {
+      if (asset.status === "OFF") continue;
+      const key = `${venue.venueId}|${asset.symbol}`;
+      const currentQty = Number(ctx.positionState.qtyByKey.get(key) || 0);
+      const finalQty = Number(finalQtyByKey.get(key) || 0);
+      const tradeQty = funding_round_(finalQty - currentQty);
+      const mark = funding_getMarkV2_(venue, asset.symbol, ctx.rateMap, ctx.markFallback, ctx.positionState);
+      if (!(mark > 0) && Math.abs(currentQty) < 1e-12 && Math.abs(finalQty) < 1e-12) continue;
+      const signal = ctx.signals.get(`${venue.fundingExchange}|${asset.symbol}`) || {
+        expectedRate8h: 0, stddev8h: 0, confidence: 0, liveRate8h: 0, source: "missing",
+      };
+      const liveRate = Number(signal.liveRate8h) || 0;
+      const livePnl8h = -finalQty * mark * liveRate;
+      const livePnlDay = livePnl8h * 3;
+      liveTotal8h += livePnl8h;
+      liveTotalDay += livePnlDay;
+
+      const adjustedRate = (Number(signal.expectedRate8h) || 0) * Math.max(0, Math.min(1, Number(signal.confidence) || 0));
+      const expectedFunding = -finalQty * mark * adjustedRate * intervals;
+      const riskPenalty = Math.abs(finalQty) * mark * (Number(signal.stddev8h) || 0) * Math.sqrt(intervals) * riskLambda;
+      const side = tradeQty >= 0 ? "buy" : "sell";
+      const cost = ctx.costMap.get(`${venue.venueId}|${asset.symbol}|${side}`) || { feeBps: venue.feeBps, slippageBps: venue.slippageBps };
+      const costBps = Math.max(0, Number(cost.feeBps) || 0) + Math.max(0, Number(cost.slippageBps) || 0);
+      const tradingCost = Math.abs(tradeQty) * mark * costBps / 10000;
+      const expectedNet = expectedFunding - riskPenalty - tradingCost;
+      expectedFundingTotal += expectedFunding;
+      riskTotal += riskPenalty;
+      costTotal += tradingCost;
+      netTotal += expectedNet;
+
+      compatRows.push([
+        venue.venueId, asset.symbol, finalQty, mark || "", liveRate,
+        finalQty * mark, livePnl8h, livePnlDay,
+        `${venue.status}|funding=${venue.fundingExchange}|${signal.source}`,
+      ]);
+      detailRows.push([
+        venue.venueId, venue.fundingExchange, venue.status, asset.symbol,
+        currentQty, finalQty, tradeQty, tradeQty, mark,
+        adjustedRate, expectedFunding, riskPenalty, tradingCost, expectedNet, signal.source,
+      ]);
+    }
+  }
+
+  if (compatRows.length) shSol.getRange(2, 1, compatRows.length, 9).setValues(compatRows);
+  const totalRow = 2 + compatRows.length + 1;
+  shSol.getRange(totalRow, 1, 1, 9).setValues([["TOTAL", "", "", "", "", "", liveTotal8h, liveTotalDay, ""]]);
+  const summaryStart = totalRow + 2;
+  shSol.getRange(summaryStart, 1, 1, 9).setValues([[
+    "exchange_summary", "gross_oi_usd", "dir_usd", "dir_limit_usd", "gross_rule",
+    "status", "funding_exchange", "deposit_usd", "neutrality_ratio",
+  ]]);
+  const summaryRows = [];
+  for (const venue of ctx.venues) {
+    if (venue.status === "OFF") continue;
+    const stats = funding_calcVenueStatsV2_(ctx, finalQtyByKey, venue);
+    const grossMax = venue.depositUsd * venue.grossMaxMult;
+    const grossRule = venue.minGrossUsd > 0
+      ? `min ${venue.minGrossUsd.toFixed(0)} / max ${grossMax.toFixed(0)}`
+      : `max ${grossMax.toFixed(0)}`;
+    summaryRows.push([
+      venue.venueId, stats.gross, stats.dir, venue.depositUsd * venue.dirLimitMult,
+      grossRule, venue.status, venue.fundingExchange, venue.depositUsd,
+      stats.gross > 0 ? Math.abs(stats.dir) / stats.gross : 0,
+    ]);
+  }
+  if (summaryRows.length) shSol.getRange(summaryStart + 1, 1, summaryRows.length, 9).setValues(summaryRows);
+
+  const detailHeaders = [
+    "venue_id", "funding_exchange", "status", "symbol", "current_qty", "final_qty",
+    "trade_qty", "carry_overlay_qty", "mark_price", "expected_rate_8h",
+    "expected_funding_usd", "risk_penalty_usd", "trading_cost_usd", "expected_net_usd", "history_source",
+  ];
+  const shDetail = funding_initSheet_(ss, OPT_SHEET_HISTORY_SOLUTION, detailHeaders);
+  funding_ensureSheetHasCols_(shDetail, 18);
+  if (shDetail.getMaxRows() > 1) {
+    shDetail.getRange(2, 1, shDetail.getMaxRows() - 1, Math.max(detailHeaders.length, shDetail.getMaxColumns())).clearContent();
+  }
+  shDetail.getRange(1, 17, 8, 2).clearContent();
+  shDetail.getRange(1, 17, 8, 2).setValues([
+    ["asOf", funding_nowKstIso_()],
+    ["horizon_days", horizonDays],
+    ["neutrality_min_usd", meta.neutralityMinUsd || 0],
+    ["neutrality_cap_usd", meta.neutralityCapUsd || 0],
+    ["expected_funding_usd", expectedFundingTotal],
+    ["risk_penalty_usd", riskTotal],
+    ["trading_cost_usd", costTotal],
+    ["expected_net_usd", netTotal],
+  ]);
+  if (detailRows.length) shDetail.getRange(2, 1, detailRows.length, detailHeaders.length).setValues(detailRows);
+
+  const reconcileStart = 2 + detailRows.length + 2;
+  shDetail.getRange(reconcileStart, 1, 1, 4).setValues([["target_reconciliation", "current_total_qty", "final_total_qty", "difference"]]);
+  const reconcileRows = [];
+  for (const asset of ctx.assets) {
+    const currentTotal = Number(ctx.positionState.targetBySymbol[asset.symbol] || 0);
+    let finalTotal = 0;
+    for (const venue of ctx.venues) finalTotal += Number(finalQtyByKey.get(`${venue.venueId}|${asset.symbol}`) || 0);
+    reconcileRows.push([asset.symbol, currentTotal, finalTotal, funding_round_(finalTotal - currentTotal)]);
+  }
+  if (reconcileRows.length) shDetail.getRange(reconcileStart + 1, 1, reconcileRows.length, 4).setValues(reconcileRows);
 }

@@ -2,13 +2,20 @@
 // Aggregates funding/mark from Variational, Binance, Lighter, Hyperliquid, 01.xyz,
 // Nado, Pacifica, Paradex, Extended and normalizes to 8h.
 
-const TARGETS = ["BTC", "ETH", "SOL", "BNB"];
+const DEFAULT_TARGETS = ["BTC", "ETH", "SOL", "BNB", "HYPE"];
+const TARGETS = Array.from(new Set(
+  String(process.env.FUNDING_TARGETS || DEFAULT_TARGETS.join(","))
+    .split(",")
+    .map((s) => String(s || "").trim().toUpperCase())
+    .filter(Boolean)
+));
 
 const BINANCE_SYMBOLS = {
   BTC: "BTCUSDT",
   ETH: "ETHUSDT",
   SOL: "SOLUSDT",
   BNB: "BNBUSDT",
+  HYPE: "HYPEUSDT",
 };
 
 const VARIATIONAL_BASE = "https://omni-client-api.prod.ap-northeast-1.variational.io";
@@ -154,11 +161,17 @@ async function getVariational() {
 async function getBinance() {
   const rows = [];
   for (const sym of TARGETS) {
-    const fSym = BINANCE_SYMBOLS[sym];
-    const prem = await fetchJson(
-      `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${fSym}`,
-      9000
-    );
+    const fSym = BINANCE_SYMBOLS[sym] || `${sym}USDT`;
+    let prem;
+    try {
+      prem = await fetchJson(
+        `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${fSym}`,
+        9000
+      );
+    } catch (e) {
+      console.log(`[binance] ${fSym} unavailable:`, String(e?.message || e));
+      continue;
+    }
 
     const mark = toNum(prem?.markPrice);
     const nextFundingRate8h = toNum(prem?.lastFundingRate);
@@ -214,14 +227,18 @@ async function getLighter() {
     const cands = candsBySym.get(sym) || [];
     if (!cands.length) continue;
 
-    const picked = cands[cands.length - 1];
+    const picked = cands.find((item) =>
+      String(pickField(item, ["exchange", "venue", "source"]) || "").toLowerCase() === "lighter"
+    ) || cands[cands.length - 1];
 
     const rateRaw = toNum(
       pickField(picked, ["funding_rate", "fundingRate", "rate", "funding_rate_raw"])
     );
-    const interval = toNum(
-      pickField(picked, ["funding_interval_s", "fundingIntervalS", "interval_s", "intervalS"])
-    ) ?? 28800;
+    // Lighter settles hourly, while this comparison endpoint exposes an
+    // already-normalized 8h-equivalent quote. Keep cadence and rate window
+    // separate so hourly snapshots do not multiply the rate again.
+    const sourceIntervalS = 3600;
+    const rateWindowS = 28800;
 
     const mark = toNum(pickField(picked, ["mark_price", "markPrice", "mark"]));
     const marketId = toNum(pickField(picked, ["market_id", "marketId", "market_index", "marketIndex"]));
@@ -230,15 +247,16 @@ async function getLighter() {
       exchange: "lighter",
       symbol: sym,
       funding_rate_raw: rateRaw,
-      source_interval_s: interval,
+      source_interval_s: sourceIntervalS,
+      funding_rate_window_s: rateWindowS,
       funding_interval_s: 28800,
       funding_rate_next_interval: rateRaw,
-      funding_rate_8h: normalizeTo8h(rateRaw, interval),
+      funding_rate_8h: rateRaw,
       mark_price: mark,
       source_ts: pickField(picked, ["timestamp", "ts", "updated_at", "updatedAt"]) ?? null,
       raw_symbol: sym,
       lighter_market_id: marketId,
-      lighter_source: "funding-rates:last-candidate",
+      lighter_source: "funding-rates:lighter (8h-equivalent quote, hourly settlement)",
       lighter_candidate_count: cands.length,
     });
   }
